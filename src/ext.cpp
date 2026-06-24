@@ -1,7 +1,6 @@
 #include <torch/extension.h>
 #include "hash/api.h"
 #include "cumesh.h"
-#include "remesh/api.h"
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -62,7 +61,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("compute_charts", &cumesh::CuMesh::compute_charts)
         .def("read_atlas_charts", &cumesh::CuMesh::read_atlas_charts);
 
-    // Remeshing functions
-    m.def("get_sparse_voxel_grid_active_vertices", &cumesh::get_sparse_voxel_grid_active_vertices);
-    m.def("simple_dual_contour", &cumesh::simple_dual_contour);
 }

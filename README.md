@@ -1,10 +1,9 @@
 # CuMesh: High-Performance Geometry Processing for PyTorch
 
-**CuMesh** is a GPU-accelerated library designed for high-performance 3D geometry processing directly within the PyTorch ecosystem. It provides efficient primitives for mesh cleaning, decimation, remeshing, and UV unwrapping.
+**CuMesh** is a GPU-accelerated library designed for high-performance 3D geometry processing directly within the PyTorch ecosystem. This Tiny3D-vendored copy keeps the design-owned mesh cleaning, decimation, and UV unwrapping primitives used by the TRELLIS worker.
 
 Key features include:
 *   **CUDA-Accelerated Mesh Operations**: Fast topology queries, simplification, hole filling, and cleaning.
-*   **Remeshing**: Remesh arbitrary meshes using narrow-band UDF and Dual Contouring.
 *   **UV Unwrapping**: Efficient UV parameterization with `xatlas` enhenced by a fast mesh clustering on the GPU.
 
 ## Installation
@@ -46,13 +45,6 @@ See the [examples](examples) directory for more detailed usage.
 *   **`get_boundary_loops()`**: Detect boundaries (access via `read_boundary_loops`).
 *   **Properties**: `num_vertices`, `num_faces`, `num_edges`, `num_boundaries`.
 
-### `cumesh.remeshing`
-*   `remesh_narrow_band_dc(...)`: Performs Dual Contouring reconstruction based on the UDF of the input mesh.
-
-### `cumesh.cuBVH`
-
-*NOTE: This is a wrapper around the [`cubvh`](https://github.com/ashawkey/cubvh) library.*
-
 ### `cumesh.Atlas`
 
 *NOTE: This is a wrapper around the [`xatlas`](https://github.com/jpcy/xatlas) library.*
@@ -68,7 +60,6 @@ See the [examples](examples) directory for more detailed usage.
 
 This package builds upon and integrates code from several excellent open-source libraries. We would like to express our gratitude to the authors of:
 
-*   **[cubvh](https://github.com/ashawkey/cubvh)**: For the high-performance CUDA BVH acceleration toolkit.
 *   **[xatlas](https://github.com/jpcy/xatlas)**: For the robust UV parameterization and atlas packing library.
 *   **[pamo](https://github.com/SarahWeiii/pamo)**: For the reference implementation of the GPU parallel edge collapse algorithm used in our mesh simplification module.
 

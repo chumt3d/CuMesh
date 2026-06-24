@@ -87,42 +87,12 @@ ext_modules = [
             "src/simplify.cu",
             "src/shared.cu",
 
-            "src/remesh/simple_dual_contour.cu",
-            "src/remesh/svox2vert.cu",
-
             "src/ext.cpp",
         ],
         extra_compile_args={
             "cxx": cxx_flags,
             "nvcc": nvcc_flags,
             
-        },
-    ),
-
-    # ===============================
-    # cubvh
-    # ===============================
-    CUDAExtension(
-        name="cumesh._cubvh",
-        sources=[
-            "third_party/cubvh/src/bvh.cu",
-            "third_party/cubvh/src/api_gpu.cu",
-            "third_party/cubvh/src/bindings.cpp",
-        ],
-        include_dirs=[
-            os.path.join(ROOT, "third_party/cubvh/include"),
-            os.path.join(ROOT, "third_party/cubvh/third_party/eigen"),
-        ],
-        extra_compile_args={
-            "cxx": cxx_flags,
-            "nvcc": nvcc_flags + [
-                # The following definitions must be undefined
-                # since we need half-precision operation.
-                "--extended-lambda",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_HALF2_OPERATORS__",
-            ],
         },
     ),
 
