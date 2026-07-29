@@ -307,7 +307,12 @@ void propagate_cost(
     size_t F = ctx.faces.size;
     size_t E = ctx.edges.size;
     ctx.propagated_costs.resize(F);
-    ctx.propagated_costs.fill(std::numeric_limits<uint64_t>::max());
+    fill_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        ctx.propagated_costs.ptr,
+        F,
+        std::numeric_limits<uint64_t>::max()
+    );
+    CUDA_CHECK(cudaGetLastError());
     propagate_cost_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.edges.ptr,
         ctx.vert2face.ptr,
@@ -456,8 +461,17 @@ void collapse_edges(
     size_t E = ctx.edges.size;
     ctx.vertices_map.resize(V + 1);
     ctx.faces_map.resize(F + 1);
-    ctx.vertices_map.fill(1);
-    ctx.faces_map.fill(1);
+    fill_kernel<<<(V+1+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        ctx.vertices_map.ptr,
+        V + 1,
+        1
+    );
+    fill_kernel<<<(F+1+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        ctx.faces_map.ptr,
+        F + 1,
+        1
+    );
+    CUDA_CHECK(cudaGetLastError());
     collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.vertices.ptr,
         ctx.faces.ptr,
@@ -529,6 +543,7 @@ void collapse_edges(
 
 
 std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing) {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     std::chrono::high_resolution_clock::time_point start, end;
 

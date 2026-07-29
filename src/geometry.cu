@@ -24,6 +24,7 @@ static __global__ void compute_face_areas_kernel(
 
 
 void CuMesh::compute_face_areas() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     size_t F = this->faces.size;
     this->face_areas.resize(F);
@@ -58,6 +59,7 @@ static __global__ void compute_face_normals_kernel(
 
 
 void CuMesh::compute_face_normals() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     size_t F = this->faces.size;
     this->face_normals.resize(F);
@@ -111,6 +113,7 @@ static __global__ void compute_vertex_normals_kernel(
 
 
 void CuMesh::compute_vertex_normals() {
+    CuMeshOperationScope operation(*this);
     if (this->vert2face.is_empty() || this->vert2face_offset.is_empty()) {
         this->get_vertex_face_adjacency();
     }

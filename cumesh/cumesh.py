@@ -1,9 +1,84 @@
-from typing import *
+from dataclasses import dataclass
+from typing import Protocol
+
 import math
 import torch
 from tqdm import tqdm
 from .xatlas import Atlas
 from . import _C
+
+
+class _NativeReleaseCompletion(Protocol):
+    device_index: int
+    stream_id: int
+    owner_id: int
+    generation: int
+    is_complete: bool
+    status: str
+
+    def wait_on_current_stream(self) -> int: ...
+
+    def synchronize(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class CuMeshReleaseCompletion:
+    _token: _NativeReleaseCompletion
+
+    @property
+    def device_index(self) -> int:
+        return int(self._token.device_index)
+
+    @property
+    def stream_id(self) -> int:
+        return int(self._token.stream_id)
+
+    @property
+    def owner_id(self) -> int:
+        return int(self._token.owner_id)
+
+    @property
+    def generation(self) -> int:
+        return int(self._token.generation)
+
+    @property
+    def is_complete(self) -> bool:
+        return bool(self._token.is_complete)
+
+    @property
+    def status(self) -> str:
+        return str(self._token.status)
+
+    def wait_on_current_stream(self) -> int:
+        return int(self._token.wait_on_current_stream())
+
+    def synchronize(self) -> None:
+        self._token.synchronize()
+
+
+@dataclass(frozen=True)
+class CuMeshReleaseResult:
+    status: str
+    buffers_released: int
+    device_index: int
+    stream_id: int
+    stream_synchronize_count: int
+    completion_token: CuMeshReleaseCompletion | None
+    quarantined_buffer_count: int
+    error_code: int
+    error_message: str
+    owner_id: int
+    generation: int
+    cleanup_error_code: int
+    cleanup_error_message: str
+    primary_error_code: int
+    primary_error_message: str
+
+    @property
+    def completion_status(self) -> str:
+        if self.completion_token is None:
+            return self.status
+        return self.completion_token.status
 
 
 class CuMesh:
@@ -58,7 +133,68 @@ class CuMesh:
         """
         self.cu_mesh.clear_cache()
 
-    def read(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def swap(self, other: "CuMesh") -> None:
+        if not isinstance(other, CuMesh):
+            raise TypeError("other must be a CuMesh")
+        self.cu_mesh.swap(other.cu_mesh)
+
+    def release_async(self, synchronize: bool = False) -> CuMeshReleaseResult:
+        """Release all owned CUDA storage in canonical stream order."""
+        result = self.cu_mesh.release_async(synchronize)
+        native_completion = result.completion_token
+        return CuMeshReleaseResult(
+            status=str(result.status),
+            buffers_released=int(result.buffers_released),
+            device_index=int(result.device_index),
+            stream_id=int(result.stream_id),
+            stream_synchronize_count=int(result.stream_synchronize_count),
+            completion_token=(
+                None if native_completion is None else CuMeshReleaseCompletion(native_completion)
+            ),
+            quarantined_buffer_count=int(result.quarantined_buffer_count),
+            error_code=int(result.error_code),
+            error_message=str(result.error_message),
+            owner_id=int(result.owner_id),
+            generation=int(result.generation),
+            cleanup_error_code=int(result.cleanup_error_code),
+            cleanup_error_message=str(result.cleanup_error_message),
+            primary_error_code=int(result.primary_error_code),
+            primary_error_message=str(result.primary_error_message),
+        )
+
+    @property
+    def allocated_buffer_count(self) -> int:
+        return int(self.cu_mesh.allocated_buffer_count())
+
+    @property
+    def owner_id(self) -> int:
+        return int(self.cu_mesh.owner_id)
+
+    @property
+    def generation(self) -> int:
+        return int(self.cu_mesh.generation)
+
+    @property
+    def device_index(self) -> int:
+        return int(self.cu_mesh.device_index)
+
+    @staticmethod
+    def destructor_release_error_count() -> int:
+        return int(_C.CuMesh.destructor_release_error_count())
+
+    @staticmethod
+    def destructor_device_synchronize_count() -> int:
+        return int(_C.CuMesh.destructor_device_synchronize_count())
+
+    @staticmethod
+    def quarantined_cuda_allocation_count() -> int:
+        return int(_C.CuMesh.quarantined_cuda_allocation_count())
+
+    @staticmethod
+    def retry_quarantined_cuda_allocations() -> None:
+        _C.CuMesh.retry_quarantined_cuda_allocations()
+
+    def read(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Read the current vertices and faces from the CuMesh.
 
@@ -122,7 +258,7 @@ class CuMesh:
         """
         return self.cu_mesh.read_manifold_boundary_adjacency()
     
-    def read_connected_components(self) -> Tuple[int, torch.Tensor]:
+    def read_connected_components(self) -> tuple[int, torch.Tensor]:
         """
         Read the connected component IDs for each face.
 
@@ -133,7 +269,7 @@ class CuMesh:
         """
         return self.cu_mesh.read_connected_components()
     
-    def read_boundary_connected_components(self) -> Tuple[int, torch.Tensor]:
+    def read_boundary_connected_components(self) -> tuple[int, torch.Tensor]:
         """
         Read the connected component IDs for each boundary edge.
 
@@ -144,7 +280,7 @@ class CuMesh:
         """
         return self.cu_mesh.read_boundary_connected_components()
     
-    def read_boundary_loops(self) -> Tuple[int, torch.Tensor, torch.Tensor]:
+    def read_boundary_loops(self) -> tuple[int, torch.Tensor, torch.Tensor]:
         """
         Read the boundary loops of the mesh.
 
@@ -156,7 +292,7 @@ class CuMesh:
         """
         return self.cu_mesh.read_boundary_loops()
     
-    def read_all_cache(self) -> Dict[str, torch.Tensor]:
+    def read_all_cache(self) -> dict[str, torch.Tensor]:
         """
         Read all cached data.
 
@@ -390,7 +526,7 @@ class CuMesh:
             perimeter_area_ratio_weight
         )
         
-    def read_atlas_charts(self) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def read_atlas_charts(self) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Read the atlas chart IDs for each face.
         
@@ -412,7 +548,7 @@ class CuMesh:
         xatlas_pack_charts_kwargs: dict={},
         return_vmaps: bool=False,
         verbose: bool=False
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Parameterize the mesh using the accelerated mesh clustering and Xatlas
         
@@ -478,4 +614,3 @@ class CuMesh:
             out.append(vmaps)
         
         return tuple(out)
-            

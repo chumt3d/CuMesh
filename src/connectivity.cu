@@ -58,6 +58,7 @@ static __global__ void fill_neighbor_face_ids_kernel(
 
 
 void CuMesh::get_vertex_face_adjacency() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     size_t F = this->faces.size;
     size_t V = this->vertices.size;
@@ -121,6 +122,7 @@ static __global__ void expand_edges_kernel(
 
 
 void CuMesh::get_edges() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     size_t F = this->faces.size;
     this->edges.resize(F * 3);
@@ -145,8 +147,8 @@ void CuMesh::get_edges() {
     ));
 
     // unique edges
-    int* num_edges;
-    CUDA_CHECK(cudaMalloc(&num_edges, sizeof(int)));
+    ScopedCudaTemporary<int> num_edges_storage(1, stream, operation.device_index());
+    int* num_edges = num_edges_storage.get();
     this->edge2face_cnt.resize(F * 3);
     CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
         nullptr, temp_storage_bytes,
@@ -162,7 +164,7 @@ void CuMesh::get_edges() {
     CUDA_CHECK(cudaMemcpyAsync(&this->edges.size, num_edges, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     this->edge2face_cnt.size = this->edges.size;
-    CUDA_CHECK(cudaFree(num_edges));
+    num_edges_storage.reset();
 }
 
 
@@ -221,6 +223,7 @@ static __global__ void get_edge_face_adjacency_kernel(
 
 
 void CuMesh::get_edge_face_adjacency() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->edges.is_empty() || this->edge2face_cnt.is_empty()) {
         this->get_edges();
@@ -328,6 +331,7 @@ static __global__ void get_vertex_edge_adjacency_kernel(
 
 
 void CuMesh::get_vertex_edge_adjacency() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->edges.is_empty()) {
         this->get_edges();
@@ -415,6 +419,7 @@ struct is_boundary_edge {
 
 
 void CuMesh::get_boundary_info() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->edges.is_empty() || this->edge2face_cnt.is_empty()) {
         this->get_edges();
@@ -423,9 +428,10 @@ void CuMesh::get_boundary_info() {
 
     // Select boundary edges
     size_t temp_storage_bytes = 0;
-    int *cu_num_boundary, *cu_edge_idx;
-    CUDA_CHECK(cudaMalloc(&cu_num_boundary, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_edge_idx, E * sizeof(int)));
+    ScopedCudaTemporary<int> num_boundary_storage(1, stream, operation.device_index());
+    ScopedCudaTemporary<int> edge_idx_storage(E, stream, operation.device_index());
+    int* cu_num_boundary = num_boundary_storage.get();
+    int* cu_edge_idx = edge_idx_storage.get();
     this->boundaries.resize(E);
     arange_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_edge_idx, E);
     CUDA_CHECK(cudaGetLastError());
@@ -446,8 +452,8 @@ void CuMesh::get_boundary_info() {
     ));
     CUDA_CHECK(cudaMemcpyAsync(&this->boundaries.size, cu_num_boundary, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_num_boundary));
-    CUDA_CHECK(cudaFree(cu_edge_idx));
+    num_boundary_storage.reset();
+    edge_idx_storage.reset();
 
     // Set vertex boundary indicator
     this->vert_is_boundary.resize(this->vertices.size);
@@ -519,6 +525,7 @@ static __global__ void get_vertex_boundary_adjacency_kernel(
 
 
 void CuMesh::get_vertex_boundary_adjacency() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->edges.is_empty()) {
         this->get_edges();
@@ -609,6 +616,7 @@ static __global__ void get_vertex_is_manifold_kernel(
 
 
 void CuMesh::get_vertex_is_manifold() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->vert2edge.is_empty() || this->vert2edge_offset.is_empty()) {
         this->get_vertex_edge_adjacency();
@@ -674,6 +682,7 @@ struct is_manifold_edge {
 
 
 void CuMesh::get_manifold_face_adjacency() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->edge2face.is_empty() || this->edge2face_offset.is_empty()) {
         this->get_edge_face_adjacency();
@@ -682,10 +691,12 @@ void CuMesh::get_manifold_face_adjacency() {
 
     // Select manifold edges
     size_t temp_storage_bytes = 0;
-    int *cu_num_manifold_edges, *cu_edge_idx, *cu_manifold_edge_idx;
-    CUDA_CHECK(cudaMalloc(&cu_num_manifold_edges, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_edge_idx, E * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_manifold_edge_idx, E * sizeof(int)));
+    ScopedCudaTemporary<int> num_manifold_edges_storage(1, stream, operation.device_index());
+    ScopedCudaTemporary<int> edge_idx_storage(E, stream, operation.device_index());
+    ScopedCudaTemporary<int> manifold_edge_idx_storage(E, stream, operation.device_index());
+    int* cu_num_manifold_edges = num_manifold_edges_storage.get();
+    int* cu_edge_idx = edge_idx_storage.get();
+    int* cu_manifold_edge_idx = manifold_edge_idx_storage.get();
     arange_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_edge_idx, E);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cub::DeviceSelect::If(
@@ -706,9 +717,8 @@ void CuMesh::get_manifold_face_adjacency() {
     int manifold_edge_count;
     CUDA_CHECK(cudaMemcpyAsync(&manifold_edge_count, cu_num_manifold_edges, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_num_manifold_edges));
-    CUDA_CHECK(cudaFree(cu_edge_idx));
-
+    num_manifold_edges_storage.reset();
+    edge_idx_storage.reset();
     // set manifold_face_adj
     this->manifold_face_adj.resize(manifold_edge_count);
     set_manifold_face_adj_kernel<<<(manifold_edge_count+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
@@ -720,7 +730,7 @@ void CuMesh::get_manifold_face_adjacency() {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_manifold_edge_idx));
+    manifold_edge_idx_storage.reset();
 }
 
 
@@ -756,6 +766,7 @@ struct is_manifold_boundary_vertex {
 
 
 void CuMesh::get_manifold_boundary_adjacency() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->vert2bound.is_empty() || this->vert2bound_offset.is_empty()) {
         this->get_vertex_boundary_adjacency();
@@ -767,10 +778,12 @@ void CuMesh::get_manifold_boundary_adjacency() {
 
     // Select manifold boundary vertices
     size_t temp_storage_bytes = 0;
-    int *cu_num_manifold_boundary_verts, *cu_vert_idx, *cu_manifold_vert_idx;
-    CUDA_CHECK(cudaMalloc(&cu_num_manifold_boundary_verts, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_vert_idx, V * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_manifold_vert_idx, V * sizeof(int)));
+    ScopedCudaTemporary<int> num_manifold_boundary_verts_storage(1, stream, operation.device_index());
+    ScopedCudaTemporary<int> vert_idx_storage(V, stream, operation.device_index());
+    ScopedCudaTemporary<int> manifold_vert_idx_storage(V, stream, operation.device_index());
+    int* cu_num_manifold_boundary_verts = num_manifold_boundary_verts_storage.get();
+    int* cu_vert_idx = vert_idx_storage.get();
+    int* cu_manifold_vert_idx = manifold_vert_idx_storage.get();
     arange_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_vert_idx, V);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cub::DeviceSelect::If(
@@ -791,12 +804,10 @@ void CuMesh::get_manifold_boundary_adjacency() {
     int manifold_boundary_vert_count;
     CUDA_CHECK(cudaMemcpyAsync(&manifold_boundary_vert_count, cu_num_manifold_boundary_verts, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_num_manifold_boundary_verts));
-    CUDA_CHECK(cudaFree(cu_vert_idx));
-
+    num_manifold_boundary_verts_storage.reset();
+    vert_idx_storage.reset();
     // Early return if no manifold boundary vertices
     if (manifold_boundary_vert_count == 0) {
-        CUDA_CHECK(cudaFree(cu_manifold_vert_idx));
         return;
     }
 
@@ -811,11 +822,12 @@ void CuMesh::get_manifold_boundary_adjacency() {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_manifold_vert_idx));
+    manifold_vert_idx_storage.reset();
 }
 
 
 void CuMesh::get_connected_components() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->manifold_face_adj.is_empty()) {
         this->get_manifold_face_adjacency();
@@ -828,8 +840,9 @@ void CuMesh::get_connected_components() {
     this->conn_comp_ids.resize(F);
     arange_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(this->conn_comp_ids.ptr, F);
     CUDA_CHECK(cudaGetLastError());
-    int* cu_end_flag; int h_end_flag;
-    CUDA_CHECK(cudaMalloc(&cu_end_flag, sizeof(int)));
+    ScopedCudaTemporary<int> end_flag_storage(1, stream, operation.device_index());
+    int* cu_end_flag = end_flag_storage.get();
+    int h_end_flag;
     do {
         h_end_flag = 1;
         CUDA_CHECK(cudaMemcpyAsync(cu_end_flag, &h_end_flag, sizeof(int), cudaMemcpyHostToDevice, stream));
@@ -853,14 +866,14 @@ void CuMesh::get_connected_components() {
         CUDA_CHECK(cudaMemcpyAsync(&h_end_flag, cu_end_flag, sizeof(int), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     } while (h_end_flag == 0);
-    CUDA_CHECK(cudaFree(cu_end_flag));
-
+    end_flag_storage.reset();
     // Compresses boundary components
     this->num_conn_comps = compress_ids(this->conn_comp_ids.ptr, F, this->cub_temp_storage);
 }
 
 
 void CuMesh::get_boundary_connected_components() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->manifold_bound_adj.is_empty()) {
         this->get_manifold_boundary_adjacency();
@@ -878,8 +891,9 @@ void CuMesh::get_boundary_connected_components() {
     this->bound_conn_comp_ids.resize(B);
     arange_kernel<<<(B+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(this->bound_conn_comp_ids.ptr, B);
     CUDA_CHECK(cudaGetLastError());
-    int* cu_end_flag; int h_end_flag;
-    CUDA_CHECK(cudaMalloc(&cu_end_flag, sizeof(int)));
+    ScopedCudaTemporary<int> end_flag_storage(1, stream, operation.device_index());
+    int* cu_end_flag = end_flag_storage.get();
+    int h_end_flag;
     do {
         h_end_flag = 1;
         CUDA_CHECK(cudaMemcpyAsync(cu_end_flag, &h_end_flag, sizeof(int), cudaMemcpyHostToDevice, stream));
@@ -903,8 +917,7 @@ void CuMesh::get_boundary_connected_components() {
         CUDA_CHECK(cudaMemcpyAsync(&h_end_flag, cu_end_flag, sizeof(int), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     } while (h_end_flag == 0);
-    CUDA_CHECK(cudaFree(cu_end_flag));
-
+    end_flag_storage.reset();
     // Compresses boundary components
     this->num_bound_conn_comps = compress_ids(this->bound_conn_comp_ids.ptr, B, this->cub_temp_storage);
 }
@@ -957,6 +970,7 @@ static __global__ void is_bound_conn_comp_loop_kernel(
 
 
 void CuMesh::get_boundary_loops() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->bound_conn_comp_ids.is_empty()) {
         this->get_boundary_connected_components();
@@ -971,8 +985,12 @@ void CuMesh::get_boundary_loops() {
     }
 
     // Check if boundary components are loops
-    int* cu_is_bound_conn_comp_loop;
-    CUDA_CHECK(cudaMalloc(&cu_is_bound_conn_comp_loop, this->num_bound_conn_comps * sizeof(int)));
+    ScopedCudaTemporary<int> is_bound_conn_comp_loop_storage(
+        this->num_bound_conn_comps,
+        stream,
+        operation.device_index()
+    );
+    int* cu_is_bound_conn_comp_loop = is_bound_conn_comp_loop_storage.get();
     fill_kernel<<<(this->num_bound_conn_comps+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_is_bound_conn_comp_loop,
         this->num_bound_conn_comps,
@@ -989,8 +1007,8 @@ void CuMesh::get_boundary_loops() {
         cu_is_bound_conn_comp_loop
     );
     CUDA_CHECK(cudaGetLastError());
-    int* cu_num_bound_loops;
-    CUDA_CHECK(cudaMalloc(&cu_num_bound_loops, sizeof(int)));
+    ScopedCudaTemporary<int> num_bound_loops_storage(1, stream, operation.device_index());
+    int* cu_num_bound_loops = num_bound_loops_storage.get();
     size_t temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceReduce::Sum(
         nullptr, temp_storage_bytes,
@@ -1007,16 +1025,16 @@ void CuMesh::get_boundary_loops() {
     ));
     CUDA_CHECK(cudaMemcpyAsync(&this->num_bound_loops, cu_num_bound_loops, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_num_bound_loops));
+    num_bound_loops_storage.reset();
     if (this->num_bound_loops == 0) {
-        CUDA_CHECK(cudaFree(cu_is_bound_conn_comp_loop));
         return;
     }
 
     // Sort boundaries by connected component ids
-    int *cu_bound_sorted, *cu_bound_conn_comp_ids_sorted;
-    CUDA_CHECK(cudaMalloc(&cu_bound_sorted, B * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_bound_conn_comp_ids_sorted, B * sizeof(int)));
+    ScopedCudaTemporary<int> bound_sorted_storage(B, stream, operation.device_index());
+    ScopedCudaTemporary<int> bound_conn_comp_ids_sorted_storage(B, stream, operation.device_index());
+    int* cu_bound_sorted = bound_sorted_storage.get();
+    int* cu_bound_conn_comp_ids_sorted = bound_conn_comp_ids_sorted_storage.get();
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, temp_storage_bytes,
@@ -1033,8 +1051,8 @@ void CuMesh::get_boundary_loops() {
     ));
 
     // Select loops
-    int* cu_bound_is_on_loop;
-    CUDA_CHECK(cudaMalloc(&cu_bound_is_on_loop, B * sizeof(int)));
+    ScopedCudaTemporary<int> bound_is_on_loop_storage(B, stream, operation.device_index());
+    int* cu_bound_is_on_loop = bound_is_on_loop_storage.get();
     index_kernel<<<(B+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_is_bound_conn_comp_loop,
         cu_bound_conn_comp_ids_sorted,
@@ -1043,9 +1061,10 @@ void CuMesh::get_boundary_loops() {
     );
     CUDA_CHECK(cudaGetLastError());
     this->loop_boundaries.resize(B);
-    int *cu_loop_bound_conn_comp_ids_sorted, *cu_num_bound_on_loop;
-    CUDA_CHECK(cudaMalloc(&cu_loop_bound_conn_comp_ids_sorted, B * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_num_bound_on_loop, sizeof(int)));
+    ScopedCudaTemporary<int> loop_bound_conn_comp_ids_sorted_storage(B, stream, operation.device_index());
+    ScopedCudaTemporary<int> num_bound_on_loop_storage(1, stream, operation.device_index());
+    int* cu_loop_bound_conn_comp_ids_sorted = loop_bound_conn_comp_ids_sorted_storage.get();
+    int* cu_num_bound_on_loop = num_bound_on_loop_storage.get();
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceSelect::Flagged(
         nullptr, temp_storage_bytes,
@@ -1061,8 +1080,8 @@ void CuMesh::get_boundary_loops() {
     int num_bound_on_loop;
     CUDA_CHECK(cudaMemcpyAsync(&num_bound_on_loop, cu_num_bound_on_loop, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_is_bound_conn_comp_loop));
-    CUDA_CHECK(cudaFree(cu_bound_sorted));
+    is_bound_conn_comp_loop_storage.reset();
+    bound_sorted_storage.reset();
     this->loop_boundaries.resize(num_bound_on_loop);
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceSelect::Flagged(
@@ -1077,16 +1096,17 @@ void CuMesh::get_boundary_loops() {
         B, stream
     ));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_bound_conn_comp_ids_sorted));
-    CUDA_CHECK(cudaFree(cu_bound_is_on_loop));
-    CUDA_CHECK(cudaFree(cu_num_bound_on_loop));
+    bound_conn_comp_ids_sorted_storage.reset();
+    bound_is_on_loop_storage.reset();
+    num_bound_on_loop_storage.reset();
 
     // RLE
     this->loop_boundaries_offset.resize(this->num_bound_loops + 1);
     this->loop_boundaries_offset.zero();
-    int* cu_rle_unique_out, *cu_rle_num_runs;
-    CUDA_CHECK(cudaMalloc(&cu_rle_unique_out, this->num_bound_loops * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_rle_num_runs, sizeof(int)));
+    ScopedCudaTemporary<int> rle_unique_out_storage(this->num_bound_loops, stream, operation.device_index());
+    ScopedCudaTemporary<int> rle_num_runs_storage(1, stream, operation.device_index());
+    int* cu_rle_unique_out = rle_unique_out_storage.get();
+    int* cu_rle_num_runs = rle_num_runs_storage.get();
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
         nullptr, temp_storage_bytes,
@@ -1102,9 +1122,9 @@ void CuMesh::get_boundary_loops() {
         num_bound_on_loop, stream
     ));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_loop_bound_conn_comp_ids_sorted));
-    CUDA_CHECK(cudaFree(cu_rle_unique_out));
-    CUDA_CHECK(cudaFree(cu_rle_num_runs));
+    loop_bound_conn_comp_ids_sorted_storage.reset();
+    rle_unique_out_storage.reset();
+    rle_num_runs_storage.reset();
 
     // Scan loop boundaries offset
     temp_storage_bytes = 0;

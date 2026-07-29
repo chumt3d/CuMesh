@@ -4,6 +4,36 @@
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    py::class_<cumesh::ReleaseCompletionToken, std::shared_ptr<cumesh::ReleaseCompletionToken>>(
+        m,
+        "ReleaseCompletionToken"
+    )
+        .def_property_readonly("device_index", &cumesh::ReleaseCompletionToken::device_index)
+        .def_property_readonly("stream_id", &cumesh::ReleaseCompletionToken::stream_id)
+        .def_property_readonly("owner_id", &cumesh::ReleaseCompletionToken::owner_id)
+        .def_property_readonly("generation", &cumesh::ReleaseCompletionToken::generation)
+        .def_property_readonly("is_complete", &cumesh::ReleaseCompletionToken::is_complete)
+        .def_property_readonly("status", &cumesh::ReleaseCompletionToken::status)
+        .def("wait_on_current_stream", &cumesh::ReleaseCompletionToken::wait_on_current_stream)
+        .def("synchronize", &cumesh::ReleaseCompletionToken::synchronize);
+
+    py::class_<cumesh::ReleaseResult>(m, "ReleaseResult")
+        .def_readonly("status", &cumesh::ReleaseResult::status)
+        .def_readonly("buffers_released", &cumesh::ReleaseResult::buffers_released)
+        .def_readonly("device_index", &cumesh::ReleaseResult::device_index)
+        .def_readonly("stream_id", &cumesh::ReleaseResult::stream_id)
+        .def_readonly("stream_synchronize_count", &cumesh::ReleaseResult::stream_synchronize_count)
+        .def_readonly("completion_token", &cumesh::ReleaseResult::completion_token)
+        .def_readonly("quarantined_buffer_count", &cumesh::ReleaseResult::quarantined_buffer_count)
+        .def_readonly("error_code", &cumesh::ReleaseResult::error_code)
+        .def_readonly("error_message", &cumesh::ReleaseResult::error_message)
+        .def_readonly("owner_id", &cumesh::ReleaseResult::owner_id)
+        .def_readonly("generation", &cumesh::ReleaseResult::generation)
+        .def_readonly("cleanup_error_code", &cumesh::ReleaseResult::cleanup_error_code)
+        .def_readonly("cleanup_error_message", &cumesh::ReleaseResult::cleanup_error_message)
+        .def_readonly("primary_error_code", &cumesh::ReleaseResult::primary_error_code)
+        .def_readonly("primary_error_message", &cumesh::ReleaseResult::primary_error_message);
+
     // Hash functions
     m.def("hashmap_insert_cuda", &cumesh::hashmap_insert_cuda);
     m.def("hashmap_lookup_cuda", &cumesh::hashmap_lookup_cuda);
@@ -21,6 +51,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("num_conneted_components", &cumesh::CuMesh::num_conneted_components)
         .def("num_boundary_conneted_components", &cumesh::CuMesh::num_boundary_conneted_components)
         .def("num_boundary_loops", &cumesh::CuMesh::num_boundary_loops)
+        .def("swap", &cumesh::CuMesh::swap)
+        .def("release_async", &cumesh::CuMesh::release_async, py::arg("synchronize") = false)
+        .def("allocated_buffer_count", &cumesh::CuMesh::allocated_buffer_count)
+        .def_property_readonly("owner_id", &cumesh::CuMesh::owner_id)
+        .def_property_readonly("generation", &cumesh::CuMesh::generation)
+        .def_property_readonly("device_index", &cumesh::CuMesh::device_index)
+        .def_static("destructor_release_error_count", &cumesh::CuMesh::destructor_release_error_count)
+        .def_static("destructor_device_synchronize_count", &cumesh::CuMesh::destructor_device_synchronize_count)
+        .def_static("quarantined_cuda_allocation_count", &cumesh::CuMesh::quarantined_cuda_allocation_count)
+        .def_static("retry_quarantined_cuda_allocations", &cumesh::CuMesh::retry_quarantined_cuda_allocations)
         .def("clear_cache", &cumesh::CuMesh::clear_cache)
         .def("init", &cumesh::CuMesh::init)
         .def("read", &cumesh::CuMesh::read)

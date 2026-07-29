@@ -164,12 +164,18 @@ __global__ void get_diff_kernel(
 template<typename T>
 int compress_ids(T* ids, size_t N, Buffer<char>& cub_temp_storage, T* inverse=nullptr) {
     cudaStream_t stream = current_stream();
-    int *cu_indices, *cu_indices_argsorted;
-    int *cu_num = nullptr;
-    T *cu_ids_sorted;
-    CUDA_CHECK(cudaMalloc(&cu_indices, N * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_indices_argsorted, N * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_ids_sorted, N * sizeof(T)));
+    const int device_index = pointer_device_index(ids);
+    ScopedCudaTemporary<int> indices_storage(N, stream, device_index);
+    ScopedCudaTemporary<int> indices_argsorted_storage(N, stream, device_index);
+    ScopedCudaTemporary<T> ids_sorted_storage(N, stream, device_index);
+    std::optional<ScopedCudaTemporary<int>> num_storage;
+    if (inverse != nullptr) {
+        num_storage.emplace(1, stream, device_index);
+    }
+    int* cu_indices = indices_storage.get();
+    int* cu_indices_argsorted = indices_argsorted_storage.get();
+    int* cu_num = inverse != nullptr ? num_storage->get() : nullptr;
+    T* cu_ids_sorted = ids_sorted_storage.get();
     arange_kernel<<<(N+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_indices, N);
     CUDA_CHECK(cudaGetLastError());
     size_t temp_storage_bytes = 0;
@@ -187,8 +193,8 @@ int compress_ids(T* ids, size_t N, Buffer<char>& cub_temp_storage, T* inverse=nu
         N, 0, sizeof(T) * 8, stream
     ));
     // get diff
-    T* cu_new_ids;
-    CUDA_CHECK(cudaMalloc(&cu_new_ids, N * sizeof(T)));
+    ScopedCudaTemporary<T> new_ids_storage(N, stream, device_index);
+    T* cu_new_ids = new_ids_storage.get();
     get_diff_kernel<<<(N+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_ids_sorted,
         cu_new_ids,
@@ -198,7 +204,6 @@ int compress_ids(T* ids, size_t N, Buffer<char>& cub_temp_storage, T* inverse=nu
 
     // inverse
     if (inverse) {
-        CUDA_CHECK(cudaMalloc(&cu_num, sizeof(int)));
         temp_storage_bytes = 0;
         CUDA_CHECK(cub::DeviceSelect::Flagged(
             nullptr, temp_storage_bytes,
@@ -239,13 +244,13 @@ int compress_ids(T* ids, size_t N, Buffer<char>& cub_temp_storage, T* inverse=nu
     CUDA_CHECK(cudaMemcpyAsync(&num_components, cu_new_ids + N-1, sizeof(T), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     num_components += 1;
-
-    // Free all scratch memory — stream is synced, all GPU work is done
-    CUDA_CHECK(cudaFree(cu_indices));
-    CUDA_CHECK(cudaFree(cu_ids_sorted));
-    CUDA_CHECK(cudaFree(cu_new_ids));
-    CUDA_CHECK(cudaFree(cu_indices_argsorted));
-    if (cu_num) CUDA_CHECK(cudaFree(cu_num));
+    indices_storage.reset();
+    ids_sorted_storage.reset();
+    new_ids_storage.reset();
+    indices_argsorted_storage.reset();
+    if (num_storage.has_value()) {
+        num_storage->reset();
+    }
 
     return static_cast<int>(num_components);
 }
@@ -256,8 +261,9 @@ int compress_ids(T* ids, size_t N, Buffer<char>& cub_temp_storage, T* inverse=nu
 template <typename T>
 void print_max_val(T* ptr, size_t size) {
     cudaStream_t stream = current_stream();
-    T* dbg_cu_max_val;
-    CUDA_CHECK(cudaMalloc(&dbg_cu_max_val, sizeof(T)));
+    const int device_index = pointer_device_index(ptr);
+    ScopedCudaTemporary<T> max_val_storage(1, stream, device_index);
+    T* dbg_cu_max_val = max_val_storage.get();
     size_t temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceReduce::Max(
         nullptr, temp_storage_bytes,
@@ -265,8 +271,8 @@ void print_max_val(T* ptr, size_t size) {
         dbg_cu_max_val,
         size, stream
     ));
-    char* temp_storage;
-    CUDA_CHECK(cudaMalloc(&temp_storage, temp_storage_bytes));
+    ScopedCudaTemporary<char> temp_storage_owner(temp_storage_bytes, stream, device_index);
+    char* temp_storage = temp_storage_owner.get();
     CUDA_CHECK(cub::DeviceReduce::Max(
         temp_storage, temp_storage_bytes,
         ptr,
@@ -277,8 +283,8 @@ void print_max_val(T* ptr, size_t size) {
     CUDA_CHECK(cudaMemcpyAsync(&h_max_val, dbg_cu_max_val, sizeof(T), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::cout << "Max value: " << h_max_val << std::endl;
-    CUDA_CHECK(cudaFree(dbg_cu_max_val));
-    CUDA_CHECK(cudaFree(temp_storage));
+    max_val_storage.reset();
+    temp_storage_owner.reset();
 }
 
 template <typename T>

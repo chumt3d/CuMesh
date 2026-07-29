@@ -32,14 +32,27 @@ static __global__ void copy_T_to_T3_kernel(
 
 
 void CuMesh::remove_faces(torch::Tensor& face_mask) {
-    cudaStream_t stream = current_stream();
+    CuMeshOperationScope operation(*this);
     size_t F = this->faces.size;
+    TORCH_CHECK(face_mask.is_cuda(), "[CuMesh] remove_faces mask must be a CUDA tensor");
+    TORCH_CHECK(face_mask.scalar_type() == torch::kBool, "[CuMesh] remove_faces mask must have bool dtype");
+    TORCH_CHECK(face_mask.dim() == 1, "[CuMesh] remove_faces mask must be one-dimensional");
+    TORCH_CHECK(
+        static_cast<std::size_t>(face_mask.numel()) == F,
+        "[CuMesh] remove_faces mask length must equal the face count"
+    );
+    TORCH_CHECK(face_mask.is_contiguous(), "[CuMesh] remove_faces mask must be contiguous");
+    TORCH_CHECK(
+        face_mask.get_device() == operation.device_index(),
+        "[CuMesh] remove_faces mask CUDA device must match the mesh device"
+    );
+    cudaStream_t stream = operation.stream();
 
     size_t temp_storage_bytes = 0;
-    int *cu_new_num_faces;
-    int3 *cu_new_faces;
-    CUDA_CHECK(cudaMalloc(&cu_new_num_faces, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_new_faces, F * sizeof(int3)));
+    ScopedCudaTemporary<int> new_num_faces_storage(1, stream, operation.device_index());
+    ScopedCudaTemporary<int3> new_faces_storage(F, stream, operation.device_index());
+    int* cu_new_num_faces = new_num_faces_storage.get();
+    int3* cu_new_faces = new_faces_storage.get();
     CUDA_CHECK(cub::DeviceSelect::Flagged(
         nullptr, temp_storage_bytes,
         this->faces.ptr, face_mask.data_ptr<bool>(), cu_new_faces, cu_new_num_faces,
@@ -57,22 +70,22 @@ void CuMesh::remove_faces(torch::Tensor& face_mask) {
     this->faces.resize(new_num_faces);
     CUDA_CHECK(cudaMemcpyAsync(this->faces.ptr, cu_new_faces, new_num_faces * sizeof(int3), cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_new_num_faces));
-    CUDA_CHECK(cudaFree(cu_new_faces));
-
+    new_num_faces_storage.reset();
+    new_faces_storage.reset();
     this->remove_unreferenced_vertices();
 }
 
 
 void CuMesh::_remove_faces(uint8_t* face_mask) {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     size_t F = this->faces.size;
 
     size_t temp_storage_bytes = 0;
-    int *cu_new_num_faces;
-    int3 *cu_new_faces;
-    CUDA_CHECK(cudaMalloc(&cu_new_num_faces, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_new_faces, F * sizeof(int3)));
+    ScopedCudaTemporary<int> new_num_faces_storage(1, stream, operation.device_index());
+    ScopedCudaTemporary<int3> new_faces_storage(F, stream, operation.device_index());
+    int* cu_new_num_faces = new_num_faces_storage.get();
+    int3* cu_new_faces = new_faces_storage.get();
     CUDA_CHECK(cub::DeviceSelect::Flagged(
         nullptr, temp_storage_bytes,
         this->faces.ptr, face_mask, cu_new_faces, cu_new_num_faces,
@@ -90,9 +103,8 @@ void CuMesh::_remove_faces(uint8_t* face_mask) {
     this->faces.resize(new_num_faces);
     CUDA_CHECK(cudaMemcpyAsync(this->faces.ptr, cu_new_faces, new_num_faces * sizeof(int3), cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_new_num_faces));
-    CUDA_CHECK(cudaFree(cu_new_faces));
-
+    new_num_faces_storage.reset();
+    new_faces_storage.reset();
     this->remove_unreferenced_vertices();
 }
 
@@ -141,13 +153,14 @@ static __global__ void remap_faces_kernel(
 
 
 void CuMesh::remove_unreferenced_vertices() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     size_t V = this->vertices.size;
     size_t F = this->faces.size;
 
     // Mark referenced vertices
-    int* cu_vertex_is_referenced;
-    CUDA_CHECK(cudaMalloc(&cu_vertex_is_referenced, (V+1) * sizeof(int)));
+    ScopedCudaTemporary<int> vertex_is_referenced_storage(V + 1, stream, operation.device_index());
+    int* cu_vertex_is_referenced = vertex_is_referenced_storage.get();
     CUDA_CHECK(cudaMemsetAsync(cu_vertex_is_referenced, 0, (V+1) * sizeof(int), stream));
     set_vertex_is_referenced<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->faces.ptr,
@@ -190,8 +203,7 @@ void CuMesh::remove_unreferenced_vertices() {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_vertex_is_referenced));
-
+    vertex_is_referenced_storage.reset();
     // Delete all cached info since mesh has changed
     this->clear_cache();
 }
@@ -247,13 +259,14 @@ struct int3_decomposer
 
 
 void CuMesh::remove_duplicate_faces() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     size_t F = this->faces.size;
 
     // Create a temporary sorted copy of faces for duplicate detection
     // Do NOT modify the original faces to preserve vertex order and normals
-    int3 *cu_sorted_faces;
-    CUDA_CHECK(cudaMalloc(&cu_sorted_faces, F * sizeof(int3)));
+    ScopedCudaTemporary<int3> sorted_faces_storage(F, stream, operation.device_index());
+    int3* cu_sorted_faces = sorted_faces_storage.get();
     CUDA_CHECK(cudaMemcpyAsync(cu_sorted_faces, this->faces.ptr, F * sizeof(int3), cudaMemcpyDeviceToDevice, stream));
 
     // Sort vertices within each face (in the temporary copy)
@@ -265,15 +278,15 @@ void CuMesh::remove_duplicate_faces() {
 
     // Sort all faces globally by their sorted vertex indices
     size_t temp_storage_bytes = 0;
-    int *cu_sorted_face_indices;
-    CUDA_CHECK(cudaMalloc(&cu_sorted_face_indices, F * sizeof(int)));
+    ScopedCudaTemporary<int> sorted_face_indices_storage(F, stream, operation.device_index());
+    int* cu_sorted_face_indices = sorted_face_indices_storage.get();
     arange_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_sorted_face_indices, F);
     CUDA_CHECK(cudaGetLastError());
 
-    int *cu_sorted_indices_output;
-    int3 *cu_sorted_faces_output;
-    CUDA_CHECK(cudaMalloc(&cu_sorted_indices_output, F * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_sorted_faces_output, F * sizeof(int3)));
+    ScopedCudaTemporary<int> sorted_indices_output_storage(F, stream, operation.device_index());
+    ScopedCudaTemporary<int3> sorted_faces_output_storage(F, stream, operation.device_index());
+    int* cu_sorted_indices_output = sorted_indices_output_storage.get();
+    int3* cu_sorted_faces_output = sorted_faces_output_storage.get();
 
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, temp_storage_bytes,
@@ -294,8 +307,8 @@ void CuMesh::remove_duplicate_faces() {
     ));
 
     // Select first in each group of duplicate faces (based on sorted faces)
-    uint8_t* cu_face_mask_sorted;
-    CUDA_CHECK(cudaMalloc(&cu_face_mask_sorted, F * sizeof(uint8_t)));
+    ScopedCudaTemporary<uint8_t> face_mask_sorted_storage(F, stream, operation.device_index());
+    uint8_t* cu_face_mask_sorted = face_mask_sorted_storage.get();
     select_first_in_each_group_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_sorted_faces_output,
         F,
@@ -306,8 +319,8 @@ void CuMesh::remove_duplicate_faces() {
     // Map the mask back to original face order using scatter
     // scatter: output[indices[i]] = values[i]
     // This maps: cu_face_mask_original[original_idx] = cu_face_mask_sorted[sorted_position]
-    uint8_t* cu_face_mask_original;
-    CUDA_CHECK(cudaMalloc(&cu_face_mask_original, F * sizeof(uint8_t)));
+    ScopedCudaTemporary<uint8_t> face_mask_original_storage(F, stream, operation.device_index());
+    uint8_t* cu_face_mask_original = face_mask_original_storage.get();
     scatter_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_sorted_indices_output,  // indices: sorted_position -> original_idx
         cu_face_mask_sorted,       // values: mask at sorted_position
@@ -316,15 +329,15 @@ void CuMesh::remove_duplicate_faces() {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_sorted_faces));
-    CUDA_CHECK(cudaFree(cu_sorted_face_indices));
-    CUDA_CHECK(cudaFree(cu_sorted_faces_output));
-    CUDA_CHECK(cudaFree(cu_face_mask_sorted));
-    CUDA_CHECK(cudaFree(cu_sorted_indices_output));
+    sorted_faces_storage.reset();
+    sorted_face_indices_storage.reset();
+    sorted_faces_output_storage.reset();
+    face_mask_sorted_storage.reset();
+    sorted_indices_output_storage.reset();
 
     // Select faces to keep (preserving original vertex order)
     this->_remove_faces(cu_face_mask_original);
-    CUDA_CHECK(cudaFree(cu_face_mask_original));
+    face_mask_original_storage.reset();
 }
 
 
@@ -366,11 +379,12 @@ static __global__ void mark_degenerate_faces_kernel(
 
 
 void CuMesh::remove_degenerate_faces(float abs_thresh, float rel_thresh) {
+    CuMeshOperationScope operation(*this);
     size_t F = this->faces.size;
 
-    uint8_t* cu_face_mask;
-    CUDA_CHECK(cudaMalloc(&cu_face_mask, F * sizeof(uint8_t)));
-    mark_degenerate_faces_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+    ScopedCudaTemporary<uint8_t> face_mask_storage(F, operation.stream(), operation.device_index());
+    uint8_t* cu_face_mask = face_mask_storage.get();
+    mark_degenerate_faces_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, operation.stream()>>>(
         this->vertices.ptr,
         this->faces.ptr,
         abs_thresh, rel_thresh,
@@ -380,7 +394,7 @@ void CuMesh::remove_degenerate_faces(float abs_thresh, float rel_thresh) {
     CUDA_CHECK(cudaGetLastError());
 
     this->_remove_faces(cu_face_mask);
-    CUDA_CHECK(cudaFree(cu_face_mask));
+    face_mask_storage.reset();
 }
 
 
@@ -448,6 +462,7 @@ struct LessThanOp {
 
 
 void CuMesh::fill_holes(float max_hole_perimeter) {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->loop_boundaries.is_empty() || this->loop_boundaries_offset.is_empty()) {
         this->get_boundary_loops();
@@ -464,8 +479,8 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     }
 
     // Compute loop boundary lengths
-    float* cu_loop_boundary_lengths;
-    CUDA_CHECK(cudaMalloc(&cu_loop_boundary_lengths, E * sizeof(float)));
+    ScopedCudaTemporary<float> loop_boundary_lengths_storage(E, stream, operation.device_index());
+    float* cu_loop_boundary_lengths = loop_boundary_lengths_storage.get();
     compute_loop_boundary_lengths<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->vertices.ptr,
         this->edges.ptr,
@@ -477,8 +492,8 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
 
     // Segment sum
     size_t temp_storage_bytes = 0;
-    float *cu_bound_loop_perimeters;
-    CUDA_CHECK(cudaMalloc(&cu_bound_loop_perimeters, L * sizeof(float)));
+    ScopedCudaTemporary<float> bound_loop_perimeters_storage(L, stream, operation.device_index());
+    float* cu_bound_loop_perimeters = bound_loop_perimeters_storage.get();
     CUDA_CHECK(cub::DeviceSegmentedReduce::Sum(
         nullptr, temp_storage_bytes,
         cu_loop_boundary_lengths, cu_bound_loop_perimeters,
@@ -498,8 +513,8 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     ));
 
     // Mask small loops
-    uint8_t* cu_bound_loop_mask;
-    CUDA_CHECK(cudaMalloc(&cu_bound_loop_mask, L * sizeof(uint8_t)));
+    ScopedCudaTemporary<uint8_t> bound_loop_mask_storage(L, stream, operation.device_index());
+    uint8_t* cu_bound_loop_mask = bound_loop_mask_storage.get();
     compare_kernel<<<(L+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_bound_loop_perimeters,
         max_hole_perimeter,
@@ -510,17 +525,18 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     CUDA_CHECK(cudaGetLastError());
 
     // Compress bound loops size
-    int* cu_bound_loops_cnt;
-    CUDA_CHECK(cudaMalloc(&cu_bound_loops_cnt, L * sizeof(int)));
+    ScopedCudaTemporary<int> bound_loops_cnt_storage(L, stream, operation.device_index());
+    int* cu_bound_loops_cnt = bound_loops_cnt_storage.get();
     diff_kernel<<<(L+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->loop_boundaries_offset.ptr,
         L,
         cu_bound_loops_cnt
     );
     CUDA_CHECK(cudaGetLastError());
-    int *cu_new_loop_boundaries_cnt, *cu_new_num_bound_loops;
-    CUDA_CHECK(cudaMalloc(&cu_new_loop_boundaries_cnt, (L+1) * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_new_num_bound_loops, sizeof(int)));
+    ScopedCudaTemporary<int> new_loop_boundaries_cnt_storage(L + 1, stream, operation.device_index());
+    ScopedCudaTemporary<int> new_num_bound_loops_storage(1, stream, operation.device_index());
+    int* cu_new_loop_boundaries_cnt = new_loop_boundaries_cnt_storage.get();
+    int* cu_new_num_bound_loops = new_num_bound_loops_storage.get();
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceSelect::Flagged(
         nullptr, temp_storage_bytes,
@@ -536,19 +552,17 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     int new_num_bound_loops;
     CUDA_CHECK(cudaMemcpyAsync(&new_num_bound_loops, cu_new_num_bound_loops, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_loop_boundary_lengths));
-    CUDA_CHECK(cudaFree(cu_bound_loop_perimeters));
-    CUDA_CHECK(cudaFree(cu_bound_loops_cnt));
-    CUDA_CHECK(cudaFree(cu_new_num_bound_loops));
+    loop_boundary_lengths_storage.reset();
+    bound_loop_perimeters_storage.reset();
+    bound_loops_cnt_storage.reset();
+    new_num_bound_loops_storage.reset();
     if (new_num_bound_loops == 0) {
-        CUDA_CHECK(cudaFree(cu_new_loop_boundaries_cnt));
-        CUDA_CHECK(cudaFree(cu_bound_loop_mask));
         return;
     }
 
     // Get loop ids of loop boundaries
-    int* cu_loop_bound_loop_ids;
-    CUDA_CHECK(cudaMalloc(&cu_loop_bound_loop_ids, E * sizeof(int)));
+    ScopedCudaTemporary<int> loop_bound_loop_ids_storage(E, stream, operation.device_index());
+    int* cu_loop_bound_loop_ids = loop_bound_loop_ids_storage.get();
     CUDA_CHECK(cudaMemsetAsync(cu_loop_bound_loop_ids, 0, E * sizeof(int), stream));
     if (L > 1) {
         set_flag_kernel<<<(L-1+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
@@ -571,8 +585,8 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     ));
 
     // Mask loop boundaries
-    uint8_t* cu_loop_boundary_mask;
-    CUDA_CHECK(cudaMalloc(&cu_loop_boundary_mask, E * sizeof(uint8_t)));
+    ScopedCudaTemporary<uint8_t> loop_boundary_mask_storage(E, stream, operation.device_index());
+    uint8_t* cu_loop_boundary_mask = loop_boundary_mask_storage.get();
     index_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_bound_loop_mask,
         cu_loop_bound_loop_ids,
@@ -582,9 +596,10 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     CUDA_CHECK(cudaGetLastError());
 
     // Compress loop boundaries
-    int *cu_new_loop_boundaries, *cu_new_num_loop_boundaries;
-    CUDA_CHECK(cudaMalloc(&cu_new_loop_boundaries, E * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_new_num_loop_boundaries, sizeof(int)));
+    ScopedCudaTemporary<int> new_loop_boundaries_storage(E, stream, operation.device_index());
+    ScopedCudaTemporary<int> new_num_loop_boundaries_storage(1, stream, operation.device_index());
+    int* cu_new_loop_boundaries = new_loop_boundaries_storage.get();
+    int* cu_new_num_loop_boundaries = new_num_loop_boundaries_storage.get();
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceSelect::Flagged(
         nullptr, temp_storage_bytes,
@@ -600,14 +615,18 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     int new_num_loop_boundaries;
     CUDA_CHECK(cudaMemcpyAsync(&new_num_loop_boundaries, cu_new_num_loop_boundaries, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_bound_loop_mask));
-    CUDA_CHECK(cudaFree(cu_loop_bound_loop_ids));
-    CUDA_CHECK(cudaFree(cu_new_num_loop_boundaries));
-    CUDA_CHECK(cudaFree(cu_loop_boundary_mask));
+    bound_loop_mask_storage.reset();
+    loop_bound_loop_ids_storage.reset();
+    new_num_loop_boundaries_storage.reset();
+    loop_boundary_mask_storage.reset();
 
     // Reconstruct new bound loops
-    int* cu_new_loop_boundaries_offset;
-    CUDA_CHECK(cudaMalloc(&cu_new_loop_boundaries_offset, (new_num_loop_boundaries+1) * sizeof(int)));
+    ScopedCudaTemporary<int> new_loop_boundaries_offset_storage(
+        new_num_loop_boundaries + 1,
+        stream,
+        operation.device_index()
+    );
+    int* cu_new_loop_boundaries_offset = new_loop_boundaries_offset_storage.get();
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, temp_storage_bytes,
@@ -620,8 +639,12 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
         cu_new_loop_boundaries_cnt, cu_new_loop_boundaries_offset,
         new_num_bound_loops + 1, stream
     ));
-    int* cu_new_loop_bound_loop_ids;
-    CUDA_CHECK(cudaMalloc(&cu_new_loop_bound_loop_ids, new_num_loop_boundaries * sizeof(int)));
+    ScopedCudaTemporary<int> new_loop_bound_loop_ids_storage(
+        new_num_loop_boundaries,
+        stream,
+        operation.device_index()
+    );
+    int* cu_new_loop_bound_loop_ids = new_loop_bound_loop_ids_storage.get();
     CUDA_CHECK(cudaMemsetAsync(cu_new_loop_bound_loop_ids, 0, new_num_loop_boundaries * sizeof(int), stream));
     if (new_num_bound_loops > 1) {
         set_flag_kernel<<<(new_num_bound_loops-1+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
@@ -644,8 +667,12 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     ));
 
     // Calculate new vertex positions as average of loop vertices
-    Vec3f* cu_new_loop_bound_centers;
-    CUDA_CHECK(cudaMalloc(&cu_new_loop_bound_centers, new_num_loop_boundaries * sizeof(Vec3f)));
+    ScopedCudaTemporary<Vec3f> new_loop_bound_centers_storage(
+        new_num_loop_boundaries,
+        stream,
+        operation.device_index()
+    );
+    Vec3f* cu_new_loop_bound_centers = new_loop_bound_centers_storage.get();
     compute_loop_boundary_midpoints<<<(new_num_loop_boundaries+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->vertices.ptr,
         this->edges.ptr,
@@ -654,8 +681,8 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
         cu_new_loop_bound_centers
     );
     CUDA_CHECK(cudaGetLastError());
-    Vec3f* cu_new_vertices;
-    CUDA_CHECK(cudaMalloc(&cu_new_vertices, new_num_bound_loops * sizeof(Vec3f)));
+    ScopedCudaTemporary<Vec3f> new_vertices_storage(new_num_bound_loops, stream, operation.device_index());
+    Vec3f* cu_new_vertices = new_vertices_storage.get();
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceSegmentedReduce::Sum(
         nullptr, temp_storage_bytes,
@@ -700,12 +727,12 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_new_loop_bound_centers));
-    CUDA_CHECK(cudaFree(cu_new_loop_boundaries_offset));
-    CUDA_CHECK(cudaFree(cu_new_loop_boundaries_cnt));
-    CUDA_CHECK(cudaFree(cu_new_vertices));
-    CUDA_CHECK(cudaFree(cu_new_loop_boundaries));
-    CUDA_CHECK(cudaFree(cu_new_loop_bound_loop_ids));
+    new_loop_bound_centers_storage.reset();
+    new_loop_boundaries_offset_storage.reset();
+    new_loop_boundaries_cnt_storage.reset();
+    new_vertices_storage.reset();
+    new_loop_boundaries_storage.reset();
+    new_loop_bound_loop_ids_storage.reset();
 
     // Delete all cached info since mesh has changed
     this->clear_cache();
@@ -785,6 +812,7 @@ static __global__ void index_vertice_kernel(
 
 
 void CuMesh::repair_non_manifold_edges(){
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     // Always recompute manifold_face_adj to ensure it's up to date
     // especially after operations like simplify() that modify the mesh
@@ -794,8 +822,8 @@ void CuMesh::repair_non_manifold_edges(){
     size_t M = this->manifold_face_adj.size;
 
     // Construct vertex adjacency pairs with manifold edges
-    int2* cu_vertex_adj_pairs;
-    CUDA_CHECK(cudaMalloc(&cu_vertex_adj_pairs, 2*M*sizeof(int2)));
+    ScopedCudaTemporary<int2> vertex_adj_pairs_storage(2 * M, stream, operation.device_index());
+    int2* cu_vertex_adj_pairs = vertex_adj_pairs_storage.get();
     construct_vertex_adj_pairs_kernel<<<(M+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->manifold_face_adj.ptr,
         this->faces.ptr,
@@ -805,12 +833,13 @@ void CuMesh::repair_non_manifold_edges(){
     CUDA_CHECK(cudaGetLastError());
 
     // Iterative Hook and Compress
-    int* cu_vertex_ids;
-    CUDA_CHECK(cudaMalloc(&cu_vertex_ids, 3 * F * sizeof(int)));
+    ScopedCudaTemporary<int> vertex_ids_storage(3 * F, stream, operation.device_index());
+    int* cu_vertex_ids = vertex_ids_storage.get();
     arange_kernel<<<(3*F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_vertex_ids, 3 * F);
     CUDA_CHECK(cudaGetLastError());
-    int* cu_end_flag; int h_end_flag;
-    CUDA_CHECK(cudaMalloc(&cu_end_flag, sizeof(int)));
+    ScopedCudaTemporary<int> end_flag_storage(1, stream, operation.device_index());
+    int* cu_end_flag = end_flag_storage.get();
+    int h_end_flag;
     do {
         h_end_flag = 1;
         CUDA_CHECK(cudaMemcpyAsync(cu_end_flag, &h_end_flag, sizeof(int), cudaMemcpyHostToDevice, stream));
@@ -834,15 +863,14 @@ void CuMesh::repair_non_manifold_edges(){
         CUDA_CHECK(cudaMemcpyAsync(&h_end_flag, cu_end_flag, sizeof(int), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     } while (h_end_flag == 0);
-    CUDA_CHECK(cudaFree(cu_end_flag));
-    CUDA_CHECK(cudaFree(cu_vertex_adj_pairs));
-
+    end_flag_storage.reset();
+    vertex_adj_pairs_storage.reset();
     // Construct new faces
-    int* cu_new_vertices_ids;
-    CUDA_CHECK(cudaMalloc(&cu_new_vertices_ids, 3 * F * sizeof(int)));
+    ScopedCudaTemporary<int> new_vertices_ids_storage(3 * F, stream, operation.device_index());
+    int* cu_new_vertices_ids = new_vertices_ids_storage.get();
     int new_V = compress_ids(cu_vertex_ids, 3 * F, this->cub_temp_storage, cu_new_vertices_ids);
-    float3* cu_new_vertices;
-    CUDA_CHECK(cudaMalloc(&cu_new_vertices, new_V * sizeof(float3)));
+    ScopedCudaTemporary<float3> new_vertices_storage(new_V, stream, operation.device_index());
+    float3* cu_new_vertices = new_vertices_storage.get();
     index_vertice_kernel<<<(new_V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_new_vertices_ids,
         this->faces.ptr,
@@ -857,9 +885,9 @@ void CuMesh::repair_non_manifold_edges(){
     copy_T_to_T3_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_vertex_ids, F, this->faces.ptr);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_new_vertices_ids));
-    CUDA_CHECK(cudaFree(cu_new_vertices));
-    CUDA_CHECK(cudaFree(cu_vertex_ids));
+    new_vertices_ids_storage.reset();
+    new_vertices_storage.reset();
+    vertex_ids_storage.reset();
 
     // Delete all cached info since mesh has changed
     this->clear_cache();
@@ -900,6 +928,7 @@ static __global__ void mark_non_manifold_faces_kernel(
 
 
 void CuMesh::remove_non_manifold_faces() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     // Get edge-face adjacency information
     if (this->edge2face.is_empty() || this->edge2face_offset.is_empty()) {
@@ -912,8 +941,8 @@ void CuMesh::remove_non_manifold_faces() {
     if (F == 0 || E == 0) return;
 
     // Initialize face mask (1 = keep all faces initially)
-    uint8_t* cu_face_keep_mask;
-    CUDA_CHECK(cudaMalloc(&cu_face_keep_mask, F * sizeof(uint8_t)));
+    ScopedCudaTemporary<uint8_t> face_keep_mask_storage(F, stream, operation.device_index());
+    uint8_t* cu_face_keep_mask = face_keep_mask_storage.get();
     CUDA_CHECK(cudaMemsetAsync(cu_face_keep_mask, 1, F * sizeof(uint8_t), stream));
 
     // Mark faces on non-manifold edges for removal
@@ -928,7 +957,7 @@ void CuMesh::remove_non_manifold_faces() {
 
     // Remove marked faces
     this->_remove_faces(cu_face_keep_mask);
-    CUDA_CHECK(cudaFree(cu_face_keep_mask));
+    face_keep_mask_storage.reset();
 
     // Clear cache since mesh has changed
     this->clear_cache();
@@ -943,6 +972,7 @@ struct GreaterThanOrEqualToOp {
 
 
 void CuMesh::remove_small_connected_components(float min_area) {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->conn_comp_ids.is_empty()) {
         this->get_connected_components();
@@ -956,10 +986,10 @@ void CuMesh::remove_small_connected_components(float min_area) {
     // 1. Sort face areas based on their connected component ID.
     // This groups all faces of the same component together.
     size_t temp_storage_bytes = 0;
-    int *cu_sorted_conn_comp_ids;
-    float *cu_sorted_face_areas;
-    CUDA_CHECK(cudaMalloc(&cu_sorted_conn_comp_ids, F * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_sorted_face_areas, F * sizeof(float)));
+    ScopedCudaTemporary<int> sorted_conn_comp_ids_storage(F, stream, operation.device_index());
+    ScopedCudaTemporary<float> sorted_face_areas_storage(F, stream, operation.device_index());
+    int* cu_sorted_conn_comp_ids = sorted_conn_comp_ids_storage.get();
+    float* cu_sorted_face_areas = sorted_face_areas_storage.get();
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, temp_storage_bytes,
         this->conn_comp_ids.ptr, cu_sorted_conn_comp_ids,
@@ -975,12 +1005,20 @@ void CuMesh::remove_small_connected_components(float min_area) {
     ));
 
     // 2. Find unique components and get the number of faces in each.
-    int* cu_conn_comp_num_faces;
-    int* cu_num_conn_comps;
-    int* cu_unique_conn_comp_ids; // Not needed, but we need to pass a valid pointer.
-    CUDA_CHECK(cudaMalloc(&cu_conn_comp_num_faces, (this->num_conn_comps + 1) * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_num_conn_comps, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_unique_conn_comp_ids, (this->num_conn_comps + 1) * sizeof(int)));
+    ScopedCudaTemporary<int> conn_comp_num_faces_storage(
+        this->num_conn_comps + 1,
+        stream,
+        operation.device_index()
+    );
+    ScopedCudaTemporary<int> num_conn_comps_storage(1, stream, operation.device_index());
+    ScopedCudaTemporary<int> unique_conn_comp_ids_storage(
+        this->num_conn_comps + 1,
+        stream,
+        operation.device_index()
+    );
+    int* cu_conn_comp_num_faces = conn_comp_num_faces_storage.get();
+    int* cu_num_conn_comps = num_conn_comps_storage.get();
+    int* cu_unique_conn_comp_ids = unique_conn_comp_ids_storage.get();
     CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
         nullptr, temp_storage_bytes,
         cu_sorted_conn_comp_ids, cu_unique_conn_comp_ids,
@@ -997,13 +1035,13 @@ void CuMesh::remove_small_connected_components(float min_area) {
     int num_conn_comps;
     CUDA_CHECK(cudaMemcpyAsync(&num_conn_comps, cu_num_conn_comps, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_num_conn_comps));
-    CUDA_CHECK(cudaFree(cu_sorted_conn_comp_ids));
-    CUDA_CHECK(cudaFree(cu_unique_conn_comp_ids));
+    num_conn_comps_storage.reset();
+    sorted_conn_comp_ids_storage.reset();
+    unique_conn_comp_ids_storage.reset();
 
     // 3. Compute the total area for each connected component via segmented reduction.
-    int* cu_conn_comp_offsets;
-    CUDA_CHECK(cudaMalloc(&cu_conn_comp_offsets, (num_conn_comps + 1) * sizeof(int)));
+    ScopedCudaTemporary<int> conn_comp_offsets_storage(num_conn_comps + 1, stream, operation.device_index());
+    int* cu_conn_comp_offsets = conn_comp_offsets_storage.get();
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, temp_storage_bytes,
@@ -1017,8 +1055,8 @@ void CuMesh::remove_small_connected_components(float min_area) {
         num_conn_comps + 1, stream
     ));
 
-    float *cu_conn_comp_areas;
-    CUDA_CHECK(cudaMalloc(&cu_conn_comp_areas, num_conn_comps * sizeof(float)));
+    ScopedCudaTemporary<float> conn_comp_areas_storage(num_conn_comps, stream, operation.device_index());
+    float* cu_conn_comp_areas = conn_comp_areas_storage.get();
     CUDA_CHECK(cub::DeviceSegmentedReduce::Sum(
         nullptr, temp_storage_bytes,
         cu_sorted_face_areas, cu_conn_comp_areas,
@@ -1038,8 +1076,8 @@ void CuMesh::remove_small_connected_components(float min_area) {
     ));
 
     // 4. Create a "keep" mask for components with area >= min_area.
-    uint8_t* cu_comp_keep_mask;
-    CUDA_CHECK(cudaMalloc(&cu_comp_keep_mask, num_conn_comps * sizeof(uint8_t)));
+    ScopedCudaTemporary<uint8_t> comp_keep_mask_storage(num_conn_comps, stream, operation.device_index());
+    uint8_t* cu_comp_keep_mask = comp_keep_mask_storage.get();
     compare_kernel<<<(num_conn_comps+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_conn_comp_areas,
         min_area,
@@ -1050,8 +1088,8 @@ void CuMesh::remove_small_connected_components(float min_area) {
     CUDA_CHECK(cudaGetLastError());
 
     // 5. Propagate the component "keep" mask to every face.
-    uint8_t* cu_face_keep_mask;
-    CUDA_CHECK(cudaMalloc(&cu_face_keep_mask, F * sizeof(uint8_t)));
+    ScopedCudaTemporary<uint8_t> face_keep_mask_storage(F, stream, operation.device_index());
+    uint8_t* cu_face_keep_mask = face_keep_mask_storage.get();
     // Use an index_kernel (gather operation)
     index_kernel<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_comp_keep_mask,      // Source array
@@ -1063,12 +1101,12 @@ void CuMesh::remove_small_connected_components(float min_area) {
 
     // 6. Select the faces to keep and update the mesh.
     this->_remove_faces(cu_face_keep_mask);
-    CUDA_CHECK(cudaFree(cu_conn_comp_num_faces));
-    CUDA_CHECK(cudaFree(cu_sorted_face_areas));
-    CUDA_CHECK(cudaFree(cu_conn_comp_offsets));
-    CUDA_CHECK(cudaFree(cu_conn_comp_areas));
-    CUDA_CHECK(cudaFree(cu_comp_keep_mask));
-    CUDA_CHECK(cudaFree(cu_face_keep_mask));
+    conn_comp_num_faces_storage.reset();
+    sorted_face_areas_storage.reset();
+    conn_comp_offsets_storage.reset();
+    conn_comp_areas_storage.reset();
+    comp_keep_mask_storage.reset();
+    face_keep_mask_storage.reset();
 }
 
 
@@ -1189,14 +1227,19 @@ static __global__ void inplace_flip_faces_with_flags_kernel(
 
 
 void CuMesh::unify_face_orientations() {
+    CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
     if (this->manifold_face_adj.is_empty()) {
         this->get_manifold_face_adjacency();
     }
 
     // 1. Compute the flipped flag for each edge.
-    uint8_t* cu_flipped;
-    CUDA_CHECK(cudaMalloc(&cu_flipped, this->manifold_face_adj.size * sizeof(uint8_t)));
+    ScopedCudaTemporary<uint8_t> flipped_storage(
+        this->manifold_face_adj.size,
+        stream,
+        operation.device_index()
+    );
+    uint8_t* cu_flipped = flipped_storage.get();
     get_flip_flags_kernel<<<(this->manifold_face_adj.size+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->manifold_face_adj.ptr,
         this->faces.ptr,
@@ -1206,12 +1249,17 @@ void CuMesh::unify_face_orientations() {
     CUDA_CHECK(cudaGetLastError());
 
     // 2. Hook edges with flipped flag.
-    int* conn_comp_with_flip;
-    CUDA_CHECK(cudaMalloc(&conn_comp_with_flip, this->faces.size * sizeof(int)));
+    ScopedCudaTemporary<int> conn_comp_with_flip_storage(
+        this->faces.size,
+        stream,
+        operation.device_index()
+    );
+    int* conn_comp_with_flip = conn_comp_with_flip_storage.get();
     arange_kernel<<<(this->faces.size+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(conn_comp_with_flip, this->faces.size, 2);
     CUDA_CHECK(cudaGetLastError());
-    int* cu_end_flag; int h_end_flag;
-    CUDA_CHECK(cudaMalloc(&cu_end_flag, sizeof(int)));
+    ScopedCudaTemporary<int> end_flag_storage(1, stream, operation.device_index());
+    int* cu_end_flag = end_flag_storage.get();
+    int h_end_flag;
     do {
         h_end_flag = 1;
         CUDA_CHECK(cudaMemcpyAsync(cu_end_flag, &h_end_flag, sizeof(int), cudaMemcpyHostToDevice, stream));
@@ -1236,8 +1284,7 @@ void CuMesh::unify_face_orientations() {
         CUDA_CHECK(cudaMemcpyAsync(&h_end_flag, cu_end_flag, sizeof(int), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     } while (h_end_flag == 0);
-    CUDA_CHECK(cudaFree(cu_end_flag));
-
+    end_flag_storage.reset();
     // 3. Flip the orientation of the faces.
     inplace_flip_faces_with_flags_kernel<<<(this->faces.size+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->faces.ptr,
@@ -1246,8 +1293,8 @@ void CuMesh::unify_face_orientations() {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(cu_flipped));
-    CUDA_CHECK(cudaFree(conn_comp_with_flip));
+    flipped_storage.reset();
+    conn_comp_with_flip_storage.reset();
 }
 
 
