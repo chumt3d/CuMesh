@@ -109,25 +109,43 @@ static __global__ void init_chart_adj_kernel(
 
 static __global__ void get_chart_edge_cnt_kernel(
     const uint64_t* chart_adj,
-    const float* chart_adj_length,
     const int E,
-    int* chart2edge_cnt,
-    float* chart_perim
+    int* chart2edge_cnt
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E) return;
 
     // get edge
     uint64_t c = chart_adj[tid];
-    float l = chart_adj_length[tid];
     int c0 = int(c >> 32);
     int c1 = int(c & 0xFFFFFFFF);
 
     // count vertex adjacent edge number
     atomicAdd(&chart2edge_cnt[c0], 1);
     atomicAdd(&chart2edge_cnt[c1], 1);
-    atomicAdd(&chart_perim[c0], l);
-    atomicAdd(&chart_perim[c1], l);
+}
+
+
+/**
+ * Sum each chart's boundary length over its id-sorted chart2edge segment.
+ * A fixed summation order keeps the perimeter, and the chart merge costs
+ * derived from it, identical from run to run; float atomicAdd would not.
+ */
+static __global__ void get_chart_perim_kernel(
+    const int* chart2edge,
+    const int* chart2edge_offset,
+    const float* chart_adj_length,
+    const int C,
+    float* chart_perim
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= C) return;
+
+    float perim = 0.0f;
+    for (int e = chart2edge_offset[tid]; e < chart2edge_offset[tid+1]; e++) {
+        perim += chart_adj_length[chart2edge[e]];
+    }
+    chart_perim[tid] = perim;
 }
 
 
@@ -382,17 +400,13 @@ static void get_chart_connectivity(
     // 2. Get chart-edge connectivity
     size_t E = mesh.atlas_chart_adj.size;
     size_t C = mesh.atlas_num_charts;
-    // 2.1 Count edge number for each chart, along with perim
-    mesh.atlas_chart2edge_cnt.resize(C);
+    // 2.1 Count edge number for each chart
+    mesh.atlas_chart2edge_cnt.resize(C + 1);  // ExclusiveSum below reads C + 1 counts
     mesh.atlas_chart2edge_cnt.zero();
-    mesh.atlas_chart_perims.resize(C);
-    mesh.atlas_chart_perims.zero();
     get_chart_edge_cnt_kernel<<<(E + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         mesh.atlas_chart_adj.ptr,
-        mesh.atlas_chart_adj_length.ptr,
         E,
-        mesh.atlas_chart2edge_cnt.ptr,
-        mesh.atlas_chart_perims.ptr
+        mesh.atlas_chart2edge_cnt.ptr
     );
     CUDA_CHECK(cudaGetLastError());
     // 2.2 Prepare CSR format for chart-edge connectivity
@@ -420,6 +434,20 @@ static void get_chart_connectivity(
         mesh.atlas_chart2edge.ptr,
         mesh.atlas_chart2edge_offset.ptr,
         mesh.atlas_chart2edge_cnt.ptr
+    );
+    CUDA_CHECK(cudaGetLastError());
+    sort_adjacency_segments(
+        mesh.atlas_chart2edge.ptr, mesh.atlas_chart2edge_offset.ptr, 2 * E, C,
+        mesh.cub_temp_storage, stream, device_index
+    );
+    // 2.4 Chart perimeters in chart2edge order
+    mesh.atlas_chart_perims.resize(C);
+    get_chart_perim_kernel<<<(C + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        mesh.atlas_chart2edge.ptr,
+        mesh.atlas_chart2edge_offset.ptr,
+        mesh.atlas_chart_adj_length.ptr,
+        C,
+        mesh.atlas_chart_perims.ptr
     );
     CUDA_CHECK(cudaGetLastError());
 }

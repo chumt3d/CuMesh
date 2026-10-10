@@ -15,6 +15,21 @@ inline cudaStream_t current_stream() {
 }
 
 
+/**
+ * Sort each segment of an atomically filled CSR adjacency by id, in place,
+ * so consumers see a scheduling-independent order. See shared.cu.
+ */
+void sort_adjacency_segments(
+    int* adjacency,
+    const int* offsets,
+    size_t num_items,
+    size_t num_segments,
+    Buffer<char>& cub_temp_storage,
+    cudaStream_t stream,
+    int device_index
+);
+
+
 template<typename T>
 __global__ void arange_kernel(T* array, int N, int stride=1) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;

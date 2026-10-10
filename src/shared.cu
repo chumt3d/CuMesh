@@ -5,6 +5,55 @@ namespace cumesh {
 
 
 /**
+ * Canonicalize an atomically filled CSR adjacency.
+ *
+ * The fill kernels claim slots with atomicAdd, so the order inside each
+ * segment depends on warp scheduling. Consumers such as the QEM and skinny-cost
+ * sums in simplify.cu accumulate floats in segment order, so an unordered
+ * segment makes their results, and every decision derived from them, vary from
+ * run to run. Sorting each segment by id gives the order a serial build would
+ * produce, independent of scheduling.
+ *
+ * @param adjacency: the CSR values, shape (num_items), sorted in place
+ * @param offsets: the CSR offsets, shape (num_segments + 1)
+ */
+void sort_adjacency_segments(
+    int* adjacency,
+    const int* offsets,
+    size_t num_items,
+    size_t num_segments,
+    Buffer<char>& cub_temp_storage,
+    cudaStream_t stream,
+    int device_index
+) {
+    if (num_items == 0 || num_segments == 0) return;
+    ScopedCudaTemporary<int> sorted_storage(num_items, stream, device_index);
+    int* sorted = sorted_storage.get();
+    size_t temp_storage_bytes = 0;
+    CUDA_CHECK(cub::DeviceSegmentedSort::SortKeys(
+        nullptr, temp_storage_bytes,
+        adjacency, sorted,
+        num_items, num_segments,
+        offsets, offsets + 1,
+        stream
+    ));
+    cub_temp_storage.resize(temp_storage_bytes);
+    CUDA_CHECK(cub::DeviceSegmentedSort::SortKeys(
+        cub_temp_storage.ptr, temp_storage_bytes,
+        adjacency, sorted,
+        num_items, num_segments,
+        offsets, offsets + 1,
+        stream
+    ));
+    CUDA_CHECK(cudaMemcpyAsync(
+        adjacency, sorted, num_items * sizeof(int),
+        cudaMemcpyDeviceToDevice, stream
+    ));
+    sorted_storage.reset();
+}
+
+
+/**
  * Hook edges
  * @param adj: the buffer for adjacency, shape (M)
  * @param M: the number of adjacency
