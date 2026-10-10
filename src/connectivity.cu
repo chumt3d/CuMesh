@@ -7,6 +7,7 @@
 
 namespace cumesh {
 
+
 /**
  * Get count of neighboring faces for each vertex
  *
@@ -93,6 +94,10 @@ void CuMesh::get_vertex_face_adjacency() {
         this->vert2face_cnt.ptr
     );
     CUDA_CHECK(cudaGetLastError());
+    sort_adjacency_segments(
+        this->vert2face.ptr, this->vert2face_offset.ptr, F * 3, V,
+        this->cub_temp_storage, stream, operation.device_index()
+    );
 }
 
 
@@ -372,6 +377,10 @@ void CuMesh::get_vertex_edge_adjacency() {
         this->vert2edge_cnt.ptr
     );
     CUDA_CHECK(cudaGetLastError());
+    sort_adjacency_segments(
+        this->vert2edge.ptr, this->vert2edge_offset.ptr, 2 * E, V,
+        this->cub_temp_storage, stream, operation.device_index()
+    );
 }
 
 
@@ -578,6 +587,10 @@ void CuMesh::get_vertex_boundary_adjacency() {
         this->vert2bound_cnt.ptr
     );
     CUDA_CHECK(cudaGetLastError());
+    sort_adjacency_segments(
+        this->vert2bound.ptr, this->vert2bound_offset.ptr, 2 * B, V,
+        this->cub_temp_storage, stream, operation.device_index()
+    );
 }
 
 
