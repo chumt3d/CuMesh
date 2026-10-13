@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import time
 from importlib.metadata import version
 from pathlib import Path
 
@@ -71,7 +72,9 @@ def run(out):
                 settings=WrapSettings(),
                 limits=WrapLimits(max_seconds=12),
             )
-            topology, passed = inspect_surface(v, f)
+            topology, passed = inspect_surface(
+                v, f, deadline_monotonic=time.monotonic() + 12
+            )
             row.update(contract_passed=passed, topology=topology, evidence=evidence)
         except WrapFailure as error:
             row.update(contract_passed=False, code=error.code, evidence=error.evidence)

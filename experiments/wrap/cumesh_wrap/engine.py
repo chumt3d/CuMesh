@@ -17,7 +17,7 @@ import warp as wp
 
 from .warp_bvh import WarpUnsignedDistanceBVH, validate_mesh
 
-WRAP_POLICY_VERSION = "tiny3d.wrap.fdm-evaluation.v1"
+WRAP_POLICY_VERSION = "tiny3d.wrap.fdm-evaluation.v2"
 
 
 class WrapFailure(RuntimeError):
@@ -220,6 +220,106 @@ def _coords(keys, n):
     return torch.stack((keys // (n * n), (keys // n) % n, keys % n), dim=-1)
 
 
+def _world_points(coords, resolution, scale, center):
+    """One rounding to the positions actually queried/stored in this frame."""
+    return ((coords.double() / resolution - 0.5) * scale + center.double()).float()
+
+
+def _edge_world_points(endpoints, planes):
+    return planes[endpoints.long(), torch.arange(3, device=planes.device)]
+
+
+def _edge_interiors(world):
+    """Parameter interval reaching representable, strictly interior f32 values.
+
+    Each point's grid-plane/open-interval classification identifies its unique
+    Freudenthal edge, provided the grid planes remain strictly increasing.
+    This prevents coordinate coincidence without a second global sort.
+    """
+    start, finish = world[:, 0], world[:, 1]
+    changing = start != finish
+    delta = finish.double() - start.double()
+    denominator = torch.where(changing, delta, torch.ones_like(delta))
+    first = torch.nextafter(start, finish).double()
+    last = torch.nextafter(finish, start).double()
+    lower = torch.where(changing, (first - start.double()) / denominator, 0).amax(1)
+    upper = torch.where(changing, (last - start.double()) / denominator, 1).amin(1)
+    valid = changing.any(1) & (lower <= upper) & (lower > 0) & (upper < 1)
+    return lower, upper, valid
+
+
+def _edge_interpolate(world, parameter):
+    return world[:, 0].double() + parameter[:, None] * (
+        world[:, 1].double() - world[:, 0].double()
+    )
+
+
+def _edge_position_valid(world, positions):
+    start, finish = world[:, 0], world[:, 1]
+    changing = start != finish
+    interior = (positions > torch.minimum(start, finish)) & (
+        positions < torch.maximum(start, finish)
+    )
+    return torch.isfinite(positions).all(1) & torch.where(
+        changing, interior, positions == start
+    ).all(1)
+
+
+def _orient_stored_faces(original, ideal, faces, away, batch_size, check):
+    """Orient from the PL field; refuse rounded zero/inverted baseline faces."""
+    for begin in range(0, len(faces), batch_size):
+        check("stored extraction faces")
+        batch = faces[begin : begin + batch_size]
+        reference, stored = ideal[batch.long()], original[batch.long()].double()
+        reference_normal = torch.cross(
+            reference[:, 1] - reference[:, 0], reference[:, 2] - reference[:, 0], dim=1
+        )
+        normal = torch.cross(
+            stored[:, 1] - stored[:, 0], stored[:, 2] - stored[:, 0], dim=1
+        )
+        valid = (
+            torch.isfinite(normal).all(1)
+            & (normal.square().sum(1) > 0)
+            & ((normal * reference_normal).sum(1) > 0)
+        )
+        if not bool(valid.all().item()):
+            raise WrapFailure(
+                "wrap_extraction_precision_invalid",
+                {"invalid_faces_in_batch": int((~valid).sum().item())},
+            )
+        flip = (reference_normal * away[begin : begin + len(batch)].double()).sum(1) < 0
+        batch[flip] = batch[flip][:, (0, 2, 1)]
+
+
+def _admit_projection(original, proposal, faces, rejected, batch_size, check):
+    """All old/new face combinations protect any subset of refused proposals.
+
+    Only one small face batch and combination are materialized at a time.
+    This protects area/orientation, not global intersection or local wall checks.
+    """
+    for begin in range(0, len(faces), batch_size):
+        check("stored projection faces")
+        batch = faces[begin : begin + batch_size].long()
+        old, new = original[batch].double(), proposal[batch].double()
+        reference = torch.cross(old[:, 1] - old[:, 0], old[:, 2] - old[:, 0], dim=1)
+        bad = torch.zeros(len(batch), dtype=torch.bool, device=faces.device)
+        for combination in range(1, 8):
+            triangle = torch.stack(
+                [new[:, k] if combination & (1 << k) else old[:, k] for k in range(3)],
+                dim=1,
+            )
+            normal = torch.cross(
+                triangle[:, 1] - triangle[:, 0], triangle[:, 2] - triangle[:, 0], dim=1
+            )
+            bad |= (
+                ~torch.isfinite(normal).all(1)
+                | (normal.square().sum(1) <= 0)
+                | ((normal * reference).sum(1) <= 0)
+            )
+        rejected[batch[bad].reshape(-1)] = True
+    return torch.where(rejected[:, None], original, proposal)
+
+
 @torch.no_grad()
 def wrap_surface(
     vertices: torch.Tensor,
@@ -285,8 +385,8 @@ def wrap_surface(
                 raise WrapFailure("wrap_deadline", {**evidence, "stage": stage})
 
         low, high = vertices.amin(dim=0), vertices.amax(dim=0)
-        center = (low + high) / 2
-        extent = float((high - low).max().item())
+        center = (low.double() + high.double()) / 2
+        extent = float((high.double() - low.double()).max().item())
         # Padding: offset + two requested voxels on each side keeps all source
         # and offset material strictly away from the seeded domain boundary.
         scale = extent + 2 * (settings.offset_mm + 2 * settings.voxel_mm)
@@ -297,10 +397,31 @@ def wrap_surface(
                 "wrap_grid_index_limit", {**evidence, "resolution": resolution}
             )
         voxel = scale / resolution
+        planes = _world_points(
+            torch.arange(n, device=device)[:, None].expand(-1, 3),
+            resolution,
+            scale,
+            center,
+        )
+        plane_steps = planes[1:] - planes[:-1]
+        if not bool(torch.isfinite(planes).all().item()) or not bool(
+            (plane_steps > 0).all().item()
+        ):
+            raise WrapFailure(
+                "wrap_grid_precision_limit", {**evidence, "resolution": resolution}
+            )
+        infinity = torch.full_like(planes, math.inf)
+        spacing = torch.maximum(
+            torch.nextafter(planes, infinity).double() - planes.double(),
+            planes.double() - torch.nextafter(planes, -infinity).double(),
+        ).amax(0)
+        # Half an ULP bounds each one-time coordinate rounding. Two such
+        # displacements cover cell-center and corner positions in refinement.
+        world_rounding = math.nextafter(float((spacing / 2).norm().item()), math.inf)
         # UDF is 1-Lipschitz. Interpolation over a cube has error <=sqrt(3)*h/2
         # (weighted variance bound). Limit displacement so every output triangle
         # remains >=minThickness/2 away from source, not only its vertices.
-        interpolation_error = math.sqrt(3) * voxel / 2
+        interpolation_error = math.sqrt(3) * voxel / 2 + 2 * world_rounding
         max_projection = (
             settings.offset_mm - settings.min_thickness_mm / 2 - interpolation_error
         )
@@ -321,6 +442,8 @@ def wrap_surface(
                 "domain_center_mm": center.tolist(),
                 "interpolation_error_bound_mm": interpolation_error,
                 "max_projection_mm": max_projection,
+                "world_rounding_bound_mm": world_rounding,
+                "position_policy": "shared_f32_grid_absolute_interpolation.v2",
             }
         )
         check("grid admission", 12 * n**3)
@@ -342,10 +465,13 @@ def wrap_surface(
         while True:
             check("refinement", coords.shape[0] * 96)
             values = bvh.unsigned_distance(
-                ((coords.float() + 0.5) / base - 0.5) * scale + center
+                _world_points(coords.double() + 0.5, base, scale, center)
             )[0]
             # Preserve upstream's 0.87 rounded-up diagonal radius and margin.
-            coords = coords[(values - settings.offset_mm).abs() <= 0.87 * scale / base]
+            coords = coords[
+                (values - settings.offset_mm).abs()
+                <= 0.87 * scale / base + 2 * world_rounding
+            ]
             evidence["refinement"].append(
                 {"resolution": base, "active_cells": coords.shape[0]}
             )
@@ -364,7 +490,7 @@ def wrap_surface(
         )
         cell_corners = inverse.reshape(-1, 8)
         del inverse, corners, corner_keys
-        points = (_coords(keys, n).float() / resolution - 0.5) * scale + center
+        points = _edge_world_points(_coords(keys, n), planes)
         values = bvh.unsigned_distance(points)[0] - settings.offset_mm
         evidence.update(
             {"active_cells": coords.shape[0], "active_corners": keys.numel()}
@@ -426,7 +552,7 @@ def wrap_surface(
         magnitudes = values.abs().clamp_min(sign_epsilon)
         phi = torch.where(exterior, magnitudes, -magnitudes)
         del states, q0, q1, count, exterior, magnitudes, steps, values
-        lattice = _coords(keys, n).float()
+        lattice = _coords(keys, n).int()
         del keys
         tetra = torch.tensor(TETS, dtype=torch.int64, device=device)
         edges = torch.tensor(TET_EDGES, dtype=torch.int64, device=device)
@@ -446,7 +572,7 @@ def wrap_surface(
             ids, negative, cases = ids[active], negative[active], cases[active]
             if not ids.shape[0]:
                 continue
-            pos = lattice[ids]
+            pos = _edge_world_points(lattice[ids], planes).double()
             away = (pos * (~negative)[:, :, None]).sum(dim=1) / (~negative).sum(dim=1)[
                 :, None
             ] - (pos * negative[:, :, None]).sum(dim=1) / negative.sum(dim=1)[:, None]
@@ -456,7 +582,7 @@ def wrap_surface(
             expanded = ids[:, None, None, :].expand(-1, 2, 3, -1)
             pairs = torch.gather(expanded, 3, edge_ids)[valid]
             triangle_edges.append(pairs.sort(dim=-1).values)
-            directions.append(away[:, None, :].expand(-1, 2, -1)[valid])
+            directions.append(away[:, None, :].expand(-1, 2, -1)[valid].float())
         if not triangle_edges:
             raise WrapFailure("wrap_empty_surface", evidence)
         check("global edge dedup", sum(t.numel() * 8 for t in triangle_edges) * 4)
@@ -470,47 +596,70 @@ def wrap_surface(
         del pairs, inverse
         endpoints = lattice[unique_edges]
         edge_phi = phi[unique_edges]
-        t = (-edge_phi[:, 0] / (edge_phi[:, 1] - edge_phi[:, 0])).clamp(0, 1)
-        original = (
-            (endpoints[:, 0] + t[:, None] * (endpoints[:, 1] - endpoints[:, 0]))
-            / resolution
-            - 0.5
-        ) * scale + center
+        check("stored-coordinate interpolation", unique_edges.shape[0] * 256)
+        world = _edge_world_points(endpoints, planes)
+        lower, upper, interval_valid = _edge_interiors(world)
+        if not bool(interval_valid.all().item()):
+            raise WrapFailure(
+                "wrap_grid_precision_limit",
+                {
+                    **evidence,
+                    "invalid_edge_interiors": int((~interval_valid).sum().item()),
+                },
+            )
+        t = (
+            -edge_phi[:, 0].double()
+            / (edge_phi[:, 1].double() - edge_phi[:, 0].double())
+        ).clamp(0, 1)
+        ideal = _edge_interpolate(world, t)
+        t = torch.maximum(torch.minimum(t, upper), lower)
+        original = _edge_interpolate(world, t).float()
+        if not bool(_edge_position_valid(world, original).all().item()):
+            raise WrapFailure("wrap_extraction_precision_invalid", evidence)
+        extraction_adjust = float((original.double() - ideal).norm(dim=1).max().item())
+        evidence["extraction_rounding_clamp_max_mm"] = extraction_adjust
+        max_projection -= extraction_adjust
+        evidence["max_projection_mm"] = max_projection
+        if max_projection < 0:
+            raise WrapFailure("wrap_thickness_resolution", evidence)
         del lattice, phi, edge_phi
         # Orient in the original PL field. After projection the patch need not
         # be planar; comparing each triangle to a centroid vector could flip only
         # one triangle of a tetra disk and break shared-edge winding.
-        triangles = original[out_faces]
-        normals = torch.cross(
-            triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0], dim=1
-        )
-        flip = (normals * away).sum(dim=1) < 0
-        out_faces[flip] = out_faces[flip][:, (0, 2, 1)]
-        del triangles, normals, away, flip
+        try:
+            _orient_stored_faces(
+                original, ideal, out_faces, away, limits.cell_batch_size, check
+            )
+        except WrapFailure as error:
+            raise WrapFailure(error.code, {**evidence, **error.evidence}) from error
+        del ideal, away
         out_vertices = original
         if settings.project_back > 0:
+            check("stored-coordinate projection", original.shape[0] * 192)
             # Upstream closest-point/barycentric target; project only along the
             # shared lattice edge so every tetra disk stays inside its own cell.
             dist, face_id, uvw = bvh.unsigned_distance(original, return_uvw=True)
-            closest = (vertices[faces[face_id]] * uvw[:, :, None]).sum(dim=1)
-            edge_vector = (endpoints[:, 1] - endpoints[:, 0]) * voxel
-            dt = ((closest - original) * edge_vector).sum(
+            closest = (
+                vertices[faces[face_id]].double() * uvw[:, :, None].double()
+            ).sum(dim=1)
+            edge_vector = world[:, 1].double() - world[:, 0].double()
+            dt = ((closest - original.double()) * edge_vector).sum(
                 dim=1
             ) / edge_vector.square().sum(dim=1)
             dt *= settings.project_back
             bound = max_projection / edge_vector.norm(dim=1)
             dt = torch.maximum(torch.minimum(dt, bound), -bound)
-            # Interior endpoints maintain the tetra sign topology; float32
-            # epsilon is numerical separation, not a geometry quality threshold.
-            # One normalized float32 epsilon is smaller than a world-coordinate
-            # ULP on large grids. Account for resolution before interpolation.
-            parameter_guard = torch.finfo(torch.float32).eps * n
-            lower = torch.minimum(t, torch.full_like(t, parameter_guard))
-            upper = torch.maximum(t, torch.full_like(t, 1 - parameter_guard))
             projected_t = torch.maximum(torch.minimum(t + dt, upper), lower)
-            out_vertices = original + (projected_t - t)[:, None] * edge_vector
+            proposal = _edge_interpolate(world, projected_t).float()
+            rejected = ~_edge_position_valid(world, proposal) | (
+                (proposal.double() - original.double()).norm(dim=1) > max_projection
+            )
+            out_vertices = _admit_projection(
+                original, proposal, out_faces, rejected, limits.cell_batch_size, check
+            )
+            evidence["projection_refused_vertices"] = int(rejected.sum().item())
             evidence["projection_max_mm"] = float(
-                (out_vertices - original).norm(dim=1).max().item()
+                (out_vertices.double() - original.double()).norm(dim=1).max().item()
             )
             del (
                 dist,
@@ -521,12 +670,12 @@ def wrap_surface(
                 dt,
                 bound,
                 projected_t,
-                lower,
-                upper,
+                proposal,
+                rejected,
             )
         else:
             evidence["projection_max_mm"] = 0.0
-        del unique_edges, endpoints, t, original
+        del unique_edges, endpoints, world, t, original, interval_valid, lower, upper
         check("topology validation", out_faces.shape[0] * 256)
         directed = out_faces[:, ((0, 1), (1, 2), (2, 0))].reshape(-1, 2)
         sorted_edges = directed.sort(dim=1).values
@@ -579,6 +728,7 @@ def wrap_surface(
                 * (
                     settings.offset_mm
                     - interpolation_error
+                    - extraction_adjust
                     - evidence["projection_max_mm"]
                 ),
                 "cuda_torch_peak_bytes": torch.cuda.max_memory_allocated(device),

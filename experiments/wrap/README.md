@@ -53,11 +53,32 @@ L4). These safeguards are estimates, **not a measured peak bound**. No consumer
 pricing is embedded. Timings/driver memory and final product acceptance are
 separate evidence. The numerical sign epsilon is float32 epsilon*domain scale.
 
+Position policy `shared_f32_grid_absolute_interpolation.v2` uses one fp64 world
+construction followed by one fp32 rounding for the queried grid corners. Grid
+planes must be finite and strictly increasing. Extraction and projection derive
+strict interior intervals from `nextafter` of those stored planes, interpolate
+in fp64, round once, and check the actual coordinate classifications. These
+classifications identify the unique Freudenthal edge; the final global position
+uniqueness check remains an independent crosscheck. Unrepresentable grids fail
+with `wrap_grid_precision_limit` instead of producing welded or deleted faces.
+
+Cell queries include the derived coordinate-rounding allowance. Extraction's
+measured rounding/clamp displacement and final stored projection displacement
+consume the existing source-margin estimate. Stored baseline faces must have
+positive area and preserve the ideal field orientation. Projection checks all
+old/proposed combinations of each face, streamed one batch/combination at a
+time, so any rejected subset leaves positive oriented faces. Global
+self-intersections and minimum local wall remain separate consumer checks.
+`frame_controls.py` exercises the actual engine in three rigid print frames,
+including a far offset; its diagnostic rows require explicit acceptance of all
+`contract_passed` flags. No source-equivalent output or frame-identical bytes
+are claimed.
+
 Every success checks edge incidence/direction, exact position coincidence,
 connectivity and positive signed volume. Conforming tetra extraction with strictly
 nonzero grid values supplies closed vertex links by construction; final exact
 artifact validators must independently confirm manifoldness/self-intersection
-and minimum wall. Projection never moves a crossing outside its shared grid edge.
+and minimum wall. Projection uses the shared lattice-edge parameter; actual rounded positions must remain strictly between its changing grid planes and equal its fixed planes. Floating coordinate rounding can move a diagonal point off the ideal straight edge; actual face checks and final validators remain required.
 Apertures below the wrapping scale and enclosed cavities may be filled and must
 be disclosed. Open concavities reachable from the domain remain empty.
 
