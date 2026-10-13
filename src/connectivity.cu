@@ -735,6 +735,7 @@ void CuMesh::get_manifold_face_adjacency() {
     edge_idx_storage.reset();
     // set manifold_face_adj
     this->manifold_face_adj.resize(manifold_edge_count);
+    if (manifold_edge_count == 0) return;
     set_manifold_face_adj_kernel<<<(manifold_edge_count+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         cu_manifold_edge_idx,
         this->edge2face.ptr,
@@ -932,6 +933,11 @@ void CuMesh::get_geometric_connected_components(torch::Tensor vertex_ids) {
 void CuMesh::get_connected_components() {
     CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
+    if (this->faces.size == 0) {
+        this->conn_comp_ids.resize(0);
+        this->num_conn_comps = 0;
+        return;
+    }
     if (this->manifold_face_adj.is_empty()) {
         this->get_manifold_face_adjacency();
     }
@@ -943,6 +949,10 @@ void CuMesh::get_connected_components() {
     this->conn_comp_ids.resize(F);
     arange_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(this->conn_comp_ids.ptr, F);
     CUDA_CHECK(cudaGetLastError());
+    if (M == 0) {
+        this->num_conn_comps = int(F);
+        return;
+    }
     ScopedCudaTemporary<int> end_flag_storage(1, stream, operation.device_index());
     int* cu_end_flag = end_flag_storage.get();
     int h_end_flag;
