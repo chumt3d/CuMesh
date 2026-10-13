@@ -435,16 +435,11 @@ void get_edge_collapse_cost(
  * @param E: the number of edges
  * @param propagated_costs: the buffer for one-ring vertex costs, shape (V)
  */
-static __global__ void propagate_cost_kernel(
-    const int3* faces,
+static __global__ void endpoint_min_cost_kernel(
     const uint64_t* edges,
-    const int* vert2face,
-    const int* vert2face_offset,
     const float* edge_collapse_costs,
-    const int V,
-    const int F,
     const int E,
-    uint64_t* propagated_costs
+    uint64_t* endpoint_min_costs
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E) return;
@@ -457,20 +452,31 @@ static __global__ void propagate_cost_kernel(
     if (!isfinite(edge_collapse_costs[tid])) return;
     uint64_t cost = pack_key_value_positive(tid, edge_collapse_costs[tid]);
 
-    // Own every vertex of both complete one-rings, including shared neighbors.
-    // Winners have disjoint stars, so cost-time links remain valid at commit.
-    for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
+    atomicMin(reinterpret_cast<unsigned long long*>(&endpoint_min_costs[e0]), static_cast<unsigned long long>(cost));
+    atomicMin(reinterpret_cast<unsigned long long*>(&endpoint_min_costs[e1]), static_cast<unsigned long long>(cost));
+}
+
+
+static __global__ void gather_star_min_cost_kernel(
+    const int3* faces, const int* vert2face, const int* vert2face_offset,
+    const uint64_t* endpoint_min_costs, int V, uint64_t* propagated_costs
+) {
+    int vertex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vertex >= V) return;
+    uint64_t minimum = std::numeric_limits<uint64_t>::max();
+    for (int f = vert2face_offset[vertex]; f < vert2face_offset[vertex+1]; ++f) {
         int3 ids = faces[vert2face[f]];
-        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.x]), static_cast<unsigned long long>(cost));
-        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.y]), static_cast<unsigned long long>(cost));
-        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.z]), static_cast<unsigned long long>(cost));
+        uint64_t a = endpoint_min_costs[ids.x];
+        uint64_t b = endpoint_min_costs[ids.y];
+        uint64_t c = endpoint_min_costs[ids.z];
+        if (a < minimum) minimum = a;
+        if (b < minimum) minimum = b;
+        if (c < minimum) minimum = c;
     }
-    for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
-        int3 ids = faces[vert2face[f]];
-        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.x]), static_cast<unsigned long long>(cost));
-        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.y]), static_cast<unsigned long long>(cost));
-        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.z]), static_cast<unsigned long long>(cost));
-    }
+    // Exactly the same minimum over all edges whose endpoint stars contain
+    // this vertex. Integer minima are order independent; isolated vertices
+    // retain MAX just as in the edge-scatter implementation.
+    propagated_costs[vertex] = minimum;
 }
 
 
@@ -482,22 +488,27 @@ void propagate_cost(
     cudaStream_t stream
 ) {
     size_t V = ctx.vertices.size;
-    size_t F = ctx.faces.size;
     size_t E = ctx.edges.size;
     ctx.propagated_costs.resize(V);
+    // QEMs in temp_storage are dead after the cost kernel on this same stream.
+    // Reuse 8V bytes of its 48V-byte workspace; no persistent allocation.
+    ctx.temp_storage.resize(V * sizeof(uint64_t));
+    auto* endpoint_min_costs = reinterpret_cast<uint64_t*>(ctx.temp_storage.ptr);
     fill_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-        ctx.propagated_costs.ptr,
+        endpoint_min_costs,
         V,
         std::numeric_limits<uint64_t>::max()
     );
     CUDA_CHECK(cudaGetLastError());
-    propagate_cost_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-        ctx.faces.ptr,
+    endpoint_min_cost_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.edges.ptr,
-        ctx.vert2face.ptr,
-        ctx.vert2face_offset.ptr,
         ctx.edge_collapse_costs.ptr,
-        V, F, E,
+        E, endpoint_min_costs
+    );
+    CUDA_CHECK(cudaGetLastError());
+    gather_star_min_cost_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        ctx.faces.ptr, ctx.vert2face.ptr, ctx.vert2face_offset.ptr,
+        endpoint_min_costs, V,
         ctx.propagated_costs.ptr
     );
     CUDA_CHECK(cudaGetLastError());

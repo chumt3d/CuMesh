@@ -221,13 +221,30 @@ static __global__ void get_edge_face_adjacency_kernel(
         }
         ids[corner] = lo;
         int slot = atomicAdd(edge_cursors + lo, 1);
-        if (slot >= edge2face_offset[lo+1] - edge2face_offset[lo]) {
+        int count = edge2face_offset[lo+1] - edge2face_offset[lo];
+        if (count > 2) atomicExch(edge_cursors + E + 2, 1);
+        if (slot >= count) {
             atomicExch(edge_cursors + E + 1, 1);
             return;
         }
         edge2face[edge2face_offset[lo] + slot] = fid;
     }
     face2edge[fid] = {ids[0], ids[1], ids[2]};
+}
+
+
+static __global__ void sort_small_edge_face_segments_kernel(
+    const int* offsets, int E, int* edge2face
+) {
+    int edge = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge >= E) return;
+    int start = offsets[edge];
+    if (offsets[edge+1] - start != 2) return;
+    int a = edge2face[start], b = edge2face[start+1];
+    if (a > b) {
+        edge2face[start] = b;
+        edge2face[start+1] = a;
+    }
 }
 
 
@@ -270,8 +287,8 @@ void CuMesh::get_edge_face_adjacency() {
     // get edge-face adjacency
     // Scan scratch is no longer live after the D2H offset synchronization.
     // Reuse that owned opaque workspace for E integer cursors.
-    this->cub_temp_storage.resize((E + 2) * sizeof(int));
-    CUDA_CHECK(cudaMemsetAsync(this->cub_temp_storage.ptr, 0, (E + 2) * sizeof(int), stream));
+    this->cub_temp_storage.resize((E + 3) * sizeof(int));
+    CUDA_CHECK(cudaMemsetAsync(this->cub_temp_storage.ptr, 0, (E + 3) * sizeof(int), stream));
     get_edge_face_adjacency_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->faces.ptr,
         this->edges.ptr,
@@ -282,7 +299,7 @@ void CuMesh::get_edge_face_adjacency() {
         this->face2edge.ptr
     );
     CUDA_CHECK(cudaGetLastError());
-    int adjacency_errors[2];
+    int adjacency_errors[3];
     CUDA_CHECK(cudaMemcpyAsync(adjacency_errors,
         reinterpret_cast<int*>(this->cub_temp_storage.ptr) + E,
         sizeof(adjacency_errors), cudaMemcpyDeviceToHost, stream));
@@ -295,6 +312,14 @@ void CuMesh::get_edge_face_adjacency() {
 
     // Segment order is canonical by face ID, including nonmanifold segments.
     // Preserve the deterministic-adjacency lane's contract after atomic fill.
+    if (!adjacency_errors[2]) {
+        // One or two IDs need only one compare/swap. The nonmanifold path below
+        // retains the full CUB sort and therefore the identical canonical CSR.
+        sort_small_edge_face_segments_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            this->edge2face_offset.ptr, E, this->edge2face.ptr);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     this->temp_storage.resize(total_edge_face_cnt * sizeof(int));
     CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortKeys(
         nullptr, temp_storage_bytes,
