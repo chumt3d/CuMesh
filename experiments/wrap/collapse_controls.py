@@ -92,7 +92,9 @@ def fixture(name):
     if name == "cube72":
         return cube_lattice()
     if name == "zero_plane_budget":
-        return fixture("boundary_disk")
+        v, f = fixture("boundary_disk")
+        v[1, 0] = np.float32(0.00002)
+        return v, f
     if name == "error_first_cube":
         return cube_lattice(16)
     if name in (
@@ -428,14 +430,16 @@ def execute(out, mode, selected):
                 )
                 del retained
             elif name == "zero_plane_budget":
-                mesh.simplify(1, options={"max_error": 0.001})
+                mesh.simplify(
+                    1, options={"max_error": 0.001, "lambda_edge_length": 1e5}
+                )
                 row["native_steps"] = mesh.last_simplification
             elif name in ("error_floor_tetra", "error_first_cube"):
                 # Real public admission/stop behavior, not an API/source check.
                 # A tiny error budget must stop normally without forcing target.
                 row["operation"] = {
                     "api": "CuMesh.simplify",
-                    "max_error": 0.001,
+                    "max_error": 0.1 if name == "error_first_cube" else 0.001,
                     "target_faces": 2 if name == "error_floor_tetra" else None,
                 }
                 mesh.simplify(

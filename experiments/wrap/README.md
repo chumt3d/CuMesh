@@ -81,11 +81,19 @@ Standard uses one accumulated error-first QEM pass. Original face planes are
 weighted by square root of double area and accumulated in float64; the metric
 is weighted RMS distance to those planes in mm. An optimal LDL proposal (or
 geometry-valid endpoint/segment fallback) rounds to actual stored float32 before
-all native predicates; commit uses that identical proposal. The named error
-cap never escalates to force a count. An optional advanced approximate count
+all native predicates; commit uses that identical proposal. The hard geometric admission cap is the outward-rounded fp64 radius of a ball
+covering every original vertex merged into each current vertex. A proposal
+merges these covers by max(radius0 + distance0, radius1 + distance1), using CUDA
+round-up intrinsics. This bounds both original and surviving face interpolants:
+legal edge contraction maps an original triangle to a surviving face/edge/vertex,
+and each mapped vertex moves at most the radius. The RMS plane metric alone
+failed palm v3 (1.016 mm sampled maximum with a 0.3215 mm RMS gate); it now ranks
+proposals, with the cluster cover providing the hard admission gate. The bound
+is conservative, and actual float32-centroid/Warp samples remain the final gate.
+The named error cap never escalates to force a count. An optional advanced approximate count
 stops further reduction, and the achieved count/error are disclosed.
 
-Reduction v3 never normalizes/restores positions or recenters outputs. The caller
+Reduction v4 never normalizes/restores positions or recenters outputs. The caller
 prepares its fixed source-to-print matrix before WRAP. The metric is an admission
 proxy, not a sampled or Hausdorff certificate: qualification streams the actual
 raw/candidate samples and keeps RAW if any final gate is failed or unresolved.
@@ -106,7 +114,7 @@ Torch allocation peaks alone omit native allocations.
 
 ## Root CuMesh collapse correction (controller371)
 
-Policy v3 retains v2's a deterministic maximal batch over one immutable cost/CSR
+Policy v4 retains v2's a deterministic maximal batch over one immutable cost/CSR
 snapshot. Each selection pass retains packed `(cost, edge ID)` priority, reserves
 chosen complete stars, removes conflicting candidates, then repeats on the
 remaining candidates. Geometry commits begin only after all selection passes.
