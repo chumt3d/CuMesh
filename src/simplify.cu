@@ -3,6 +3,8 @@
 #include <cub/cub.cuh>
 #include <c10/cuda/CUDAStream.h>
 #include "shared.h"
+#include <cmath>
+#include <cstdint>
 
 // Tiny3D modification: topology-preserving contractions and independent stars.
 // MIT (repository LICENSE). Link condition, not copied implementation:
@@ -361,9 +363,14 @@ static __global__ void get_edge_collapse_cost_kernel(
         for (int f=vert2face_offset[e1];f<vert2face_offset[e1+1];++f)
             if (!process_incident_tri(vert2face[f],e1,e0,vertices,faces,v,skinny,count)) {valid=false;break;}
         if (!valid) continue;
-        double cost=error+lambda_edge_length*length2;
-        if (count) cost+=lambda_skinny*(skinny/count)*length2;
-        if (isfinite(cost)&&(error<best_error||(error==best_error&&cost<best_cost))) {best_error=error;best_cost=cost;best=candidates[k];}
+        // Error-limited callers rank and admit by the original-plane metric.
+        // Legacy count-only calls may still use their requested regularizers.
+        double cost=error;
+        if (!isfinite(max_error_squared)) {
+            cost+=lambda_edge_length*length2;
+            if (count) cost+=lambda_skinny*(skinny/count)*length2;
+        }
+        if (isfinite(cost)&&(cost<best_cost||(cost==best_cost&&error<best_error))) {best_error=error;best_cost=cost;best=candidates[k];}
     }
     edge_collapse_costs[tid]=isfinite(best_cost)?float(best_cost):INFINITY;
     proposed_positions[tid]=best;
@@ -472,7 +479,7 @@ void propagate_cost(
     size_t E = ctx.edges.size;
     ctx.propagated_costs.resize(V);
     // QEMs in temp_storage are dead after the cost kernel on this same stream.
-    // Reuse 8V bytes of its 48V-byte workspace; no persistent allocation.
+    // Reuse 8V bytes of its 96V-byte workspace; no persistent allocation.
     ctx.temp_storage.resize(V * sizeof(uint64_t));
     auto* endpoint_min_costs = reinterpret_cast<uint64_t*>(ctx.temp_storage.ptr);
     fill_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
@@ -609,7 +616,7 @@ static __global__ void retain_chosen_costs_kernel(
 }
 
 
-static void select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStream_t stream, bool timing) {
+static int select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStream_t stream, bool timing) {
     size_t V = ctx.vertices.size, E = ctx.edges.size;
     // This CSR/CUB workspace is dead until compression. Keep active/chosen
     // edges and reserved vertices separate from the 8V endpoint-min workspace.
@@ -650,6 +657,7 @@ static void select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStre
         chosen, E, ctx.edge_collapse_costs.ptr);
     CUDA_CHECK(cudaGetLastError());
     if (timing) std::cout << "collapse_selection: waves=" << waves << " chosen=" << total_chosen << std::endl;
+    return total_chosen;
 }
 
 
@@ -743,12 +751,23 @@ static __global__ void compress_faces_kernel(
 /**
  * Collapse edges parallelly
  */
+// Match io.cu: allocate on the actual caller stream and record native use.
+static torch::Tensor allocate_quadric_rows(int64_t rows,const torch::TensorOptions& options,
+    const c10::cuda::CUDAStream& output_stream,const c10::cuda::CUDAStream& execution_stream) {
+    torch::Tensor out;
+    {c10::cuda::CUDAStreamGuard allocation_guard(output_stream);out=torch::empty({rows,int64_t(12)},options);}
+    if (output_stream!=execution_stream) record_tensor_on_stream(out,execution_stream);
+    return out;
+}
+
+
 void collapse_edges(
     CuMesh& ctx,
     float collapse_thresh,
     cudaStream_t stream,
     bool timing,const float3* proposed_positions,
-    const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,int* merge_partner
+    const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,int* merge_partner,
+    const c10::cuda::CUDAStream& output_stream,const c10::cuda::CUDAStream& execution_stream
 ) {
     size_t V = ctx.vertices.size;
     size_t F = ctx.faces.size;
@@ -766,7 +785,10 @@ void collapse_edges(
         1
     );
     CUDA_CHECK(cudaGetLastError());
-    select_maximal_collapse_batch(ctx, collapse_thresh, stream, timing);
+    int chosen=select_maximal_collapse_batch(ctx,collapse_thresh,stream,timing);
+    // The newly introduced large Torch allocation must fail before geometry
+    // changes. Disjoint chosen stars each remove exactly one endpoint.
+    if (next_quadrics) *next_quadrics=allocate_quadric_rows(int64_t(V)-chosen,previous_quadrics->options(),output_stream,execution_stream);
 
     collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.vertices.ptr,
@@ -798,7 +820,7 @@ void collapse_edges(
     CUDA_CHECK(cudaMemcpyAsync(&new_num_vertices, ctx.vertices_map.ptr + V, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (next_quadrics) {
-        *next_quadrics=torch::empty({int64_t(new_num_vertices),int64_t(12)},previous_quadrics->options());
+        TORCH_CHECK(next_quadrics->size(0)==new_num_vertices,"[CuMesh] accumulated quadric vertex count mismatch");
         compress_quadrics_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,stream>>>(
             ctx.vertices_map.ptr,merge_partner,reinterpret_cast<const QEM*>(previous_quadrics->data_ptr<double>()),V,
             reinterpret_cast<QEM*>(next_quadrics->data_ptr<double>()));
@@ -843,7 +865,7 @@ void collapse_edges(
 }
 
 
-static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_length,float lambda_skinny,float threshold,bool timing,const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,double max_error_squared) {
+static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_length,float lambda_skinny,float threshold,bool timing,const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,double max_error_squared,const c10::cuda::CUDAStream* output_stream) {
     CuMeshOperationScope operation(ctx);
     cudaStream_t stream=operation.stream();
     std::chrono::high_resolution_clock::time_point start, end;
@@ -899,7 +921,7 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    collapse_edges(ctx,threshold,stream,timing,proposals.get(),previous_quadrics,next_quadrics,partners.get());
+    collapse_edges(ctx,threshold,stream,timing,proposals.get(),previous_quadrics,next_quadrics,partners.get(),output_stream?*output_stream:operation.caller_stream(),operation.execution_stream());
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -914,7 +936,7 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
 
 
 std::tuple<int,int> CuMesh::simplify_step(float edge,float skinny,float threshold,bool timing) {
-    return simplify_step_impl(*this,edge,skinny,threshold,timing,nullptr,nullptr,INFINITY);
+    return simplify_step_impl(*this,edge,skinny,threshold,timing,nullptr,nullptr,INFINITY,nullptr);
 }
 
 // Call-owned Tensor state survives clear_cache without adding sticky native state.
@@ -922,7 +944,7 @@ torch::Tensor CuMesh::initial_simplification_quadrics() {
     CuMeshOperationScope operation(*this);
     get_vertex_face_adjacency();
     static_assert(sizeof(QEM)==12*sizeof(double),"quadric Tensor layout");
-    auto out=torch::empty({int64_t(vertices.size),int64_t(12)},torch::TensorOptions().dtype(torch::kFloat64).device(torch::Device(torch::kCUDA,operation.device_index())));
+    auto out=allocate_quadric_rows(int64_t(vertices.size),torch::TensorOptions().dtype(torch::kFloat64).device(torch::Device(torch::kCUDA,operation.device_index())),operation.caller_stream(),operation.execution_stream());
     get_qem_kernel<<<(vertices.size+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,operation.stream()>>>(
         vertices.ptr,faces.ptr,vert2face.ptr,vert2face_offset.ptr,vertices.size,faces.size,reinterpret_cast<QEM*>(out.data_ptr<double>()));
     CUDA_CHECK(cudaGetLastError());
@@ -936,9 +958,12 @@ std::tuple<int,int,torch::Tensor> CuMesh::simplify_step_accumulated(
     TORCH_CHECK(quadrics.is_cuda()&&quadrics.get_device()==operation.device_index(),"quadrics must share canonical CUDA device");
     TORCH_CHECK(quadrics.scalar_type()==torch::kFloat64&&quadrics.is_contiguous(),"quadrics must be contiguous float64");
     TORCH_CHECK(quadrics.dim()==2&&quadrics.size(0)==vertices.size&&quadrics.size(1)==12,"quadrics must match vertices and 12-double layout");
+    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(quadrics.data_ptr<double>())%alignof(QEM)==0,"quadrics must be 16-byte aligned");
     TORCH_CHECK(max_error_squared>=0.0&&!std::isnan(max_error_squared),"invalid quadric error bound");
+    record_tensor_on_stream(quadrics,operation.execution_stream());
     torch::Tensor next;
-    auto counts=simplify_step_impl(*this,edge,skinny,threshold,timing,&quadrics,&next,max_error_squared);
+    auto caller=operation.caller_stream();
+    auto counts=simplify_step_impl(*this,edge,skinny,threshold,timing,&quadrics,&next,max_error_squared,&caller);
     return std::make_tuple(std::get<0>(counts),std::get<1>(counts),next);
 }
 
