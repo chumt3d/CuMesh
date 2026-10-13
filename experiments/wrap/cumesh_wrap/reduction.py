@@ -202,7 +202,21 @@ def reduce_surface(
         )
         # Upstream Python/native defaults retained. The subprocess caller supplies
         # a hard deadline around this native API, which has no cancellation hook.
-        mesh.simplify(target, verbose=False)
+        qem_stop = None
+        try:
+            mesh.simplify(
+                target,
+                verbose=False,
+                options={"deadline_monotonic": deadline_monotonic},
+            )
+        except cumesh.SimplificationFailure as error:
+            qem_stop = {
+                "code": error.code,
+                "target_faces": error.target_faces,
+                "remaining_faces": error.remaining_faces,
+            }
+        # Unreferenced positions are not mesh components and carry no geometry.
+        mesh.remove_unreferenced_vertices()
         cv, cf = mesh.read()
         cv = (cv * settings.normalization_mm + center).contiguous()
         cf = cf.int().contiguous()
@@ -215,6 +229,7 @@ def reduce_surface(
             "vertices": len(cv),
             "faces": len(cf),
             "qem_seconds": time.monotonic() - qem_started,
+            "qem_stop": qem_stop,
         }
         evidence["attempts"].append(row)
         try:

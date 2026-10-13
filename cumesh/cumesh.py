@@ -2,10 +2,21 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import math
+import time
 import torch
 from tqdm import tqdm
 from .xatlas import Atlas
 from . import _C
+
+
+class SimplificationFailure(RuntimeError):
+    """Target/deadline not reached; the current mesh remains owned and readable."""
+
+    def __init__(self, code: str, target_faces: int, remaining_faces: int):
+        self.code = code
+        self.target_faces = target_faces
+        self.remaining_faces = remaining_faces
+        super().__init__(f"{code}: target={target_faces}, remaining={remaining_faces}")
 
 
 class _NativeReleaseCompletion(Protocol):
@@ -460,7 +471,12 @@ class CuMesh:
         Args:
             target_num_faces: the target number of faces to simplify to.
             verbose: whether to print the progress of the simplification.
-            options: a dictionary of options for the simplification algorithm.
+            options: algorithm options; optional deadline_monotonic bounds the
+                operation between native steps.
+
+        Raises:
+            SimplificationFailure: deadline or no legal progress before target.
+                The current mesh remains readable through read().
         """
         assert isinstance(target_num_faces, int) and target_num_faces > 0, "target_num_faces must be a positive integer"
 
@@ -474,25 +490,36 @@ class CuMesh:
         thresh = options.get('thresh', 1e-8)
         lambda_edge_length = options.get('lambda_edge_length', 1e-2)
         lambda_skinny = options.get('lambda_skinny', 1e-3)
-        while True:
+        deadline = options.get('deadline_monotonic')
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("deadline_monotonic must be finite")
+        maximum_threshold = torch.finfo(torch.float32).max
+        if not math.isfinite(thresh) or not 0 <= thresh <= maximum_threshold:
+            raise ValueError("thresh must be finite, nonnegative and representable as float32")
+        try:
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise SimplificationFailure("simplify_deadline", target_num_faces, num_face)
+                if verbose:
+                    pbar.set_description(f"Simplifying [thres={thresh:.2e}]")
+                new_num_vert, new_num_face = self.cu_mesh.simplify_step(lambda_edge_length, lambda_skinny, thresh, False)
+                if verbose:
+                    pbar.update(num_face - max(target_num_faces, new_num_face))
+                if new_num_face <= target_num_faces:
+                    break
+                deleted = num_face - new_num_face
+                if deleted == 0 and thresh == maximum_threshold:
+                    # Every finite float32 cost was eligible in this step. No
+                    # legal contraction remains; infinity must never force one.
+                    raise SimplificationFailure("simplify_no_legal_progress", target_num_faces, new_num_face)
+                if deleted / num_face < 1e-2:
+                    # Preserve upstream threshold escalation without overflow.
+                    # A zero user threshold also advances to the format minimum.
+                    thresh = min(maximum_threshold, max(thresh * 10, torch.finfo(torch.float32).tiny))
+                num_face = new_num_face
+        finally:
             if verbose:
-                pbar.set_description(f"Simplifying [thres={thresh:.2e}]")
-            
-            new_num_vert, new_num_face = self.cu_mesh.simplify_step(lambda_edge_length, lambda_skinny, thresh, False)
-            
-            if verbose:
-                pbar.update(num_face - max(target_num_faces, new_num_face))
-
-            if new_num_face <= target_num_faces:
-                break
-            
-            del_num_face = num_face - new_num_face
-            if del_num_face / num_face < 1e-2:
-                thresh *= 10
-            num_face = new_num_face
-            
-        if verbose:
-            pbar.close()
+                pbar.close()
             
     def compute_charts(
         self,

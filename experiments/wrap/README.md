@@ -62,17 +62,18 @@ Apertures below the wrapping scale and enclosed cavities may be filled and must
 be disclosed. Open concavities reachable from the domain remain empty.
 
 Install this isolated Python distribution through Socket Firewall with existing
-Torch>=2.5 and `warp-lang==1.13.0`; no CUDA/NVCC extension build is required. The
-parent production CuMesh distribution is untouched. Source base is the exact
-parent gitlink31e62e1d1adcb4cb7132989137d88aa5042fae54.
+Torch>=2.5 and `warp-lang==1.13.0`; the WRAP surface engine itself has no extension
+build. The corrected native CuMesh reduction below requires a CUDA/NVCC build.
+Fork source base is the exact parent gitlink31e62e1d1adcb4cb7132989137d88aa5042fae54;
+production sees fork changes only after an explicit parent gitlink update.
 
 ## Bounded reduction pilot
 
-`reduce_surface` proposes a QEM reduction using the installed CuMesh Python API.
-Its checked source is owned-fork base31e62e1, with upstream defaults retained;
-runtime Python/native hashes and Torch/CUDA versions are recorded. A native
-binary without build provenance is labeled an untrusted proposer. Candidate
-qualification does not infer binary source correspondence from a package name.
+`reduce_surface` proposes a QEM reduction using the CuMesh Python API. Its initial
+pilot uses owned-fork base31e62e1's Python/defaults and records installed native
+SHA, without claiming that binary's build provenance. Subsequent pilots use the
+explicit source-built correction below. Candidate qualification does not infer
+binary source correspondence from a package name.
 
 The Standard pilot allocates one quarter of the existing product's source
 tolerance (`8*0.001*source_bbox_diagonal_mm`) to sampled wrap/candidate deviation.
@@ -93,3 +94,33 @@ surface or Hausdorff bound. Final exact vertex links/self-intersection, wall,
 source fidelity, cleanup, parts policy and actual STL/3MF bytes remain independent
 product gates. Driver memory is sampled during raw+native+candidate/BVH overlap;
 Torch allocation peaks alone omit native allocations.
+
+## Root CuMesh collapse correction (controller371)
+
+The initial three closed WRAP candidates became nonmanifold under both permitted
+QEM attempts. `src/simplify.cu` now checks the full simplicial link: shared
+neighbors must be the edge's one boundary or two interior opposites, and a common
+opposite-pair link edge is forbidden (tetrahedron/duplicate-face case). An
+interior edge joining two boundary vertices is rejected. A boundary contraction
+cannot erase a last isolated triangle. Sorted unique native edge keys provide
+binary-search membership, with O(degree*log E) work and no extra neighbor sets.
+The conceptual source is [Dey et al., 1999](https://research-explorer.ista.ac.at/record/3582);
+the implementation is independently written under the repository MIT license.
+
+Cost-time validity rejects zero/nonfinite triangle area and nonpositive normal
+dot products. Packed cost admission is finite and nonnegative. Propagation and
+commit own every vertex in each complete endpoint one-ring using the existing
+deterministic (cost,edge ID) ordering. This is stricter than legacy face-star
+ownership; its throughput impact is measured separately. Local link/normal
+conditions do not certify global self-intersection or local wall thickness.
+
+`simplify` preserves upstream threshold escalation but clamps it to float32's
+largest finite value. A stalled step at that value emits `SimplificationFailure`
+with code `simplify_no_legal_progress`, target and remaining counts; the current
+mesh stays readable. Optional `deadline_monotonic` in the existing options dict
+emits `simplify_deadline` between native steps. The root change applies to all
+CuMesh callers without a native signature/ABI argument change. Consumers must
+handle failure honestly; an unreachable target is never forced by infinity.
+WRAP independently qualifies the readable result and removes only unreferenced
+positions. Root source, Python, toolchain and native artifact hashes are recorded
+by the dev CPU2 build; actual behavior is checked separately on L4.

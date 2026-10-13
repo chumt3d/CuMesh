@@ -1,2 +1,2 @@
-from .cumesh import CuMesh
+from .cumesh import CuMesh, SimplificationFailure
 from .xatlas import Atlas

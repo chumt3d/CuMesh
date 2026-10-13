@@ -4,6 +4,11 @@
 #include <c10/cuda/CUDAStream.h>
 #include "shared.h"
 
+// Tiny3D modification: topology-preserving contractions and independent stars.
+// MIT (repository LICENSE). Link condition, not copied implementation:
+// Dey, Edelsbrunner, Guha, Nekhayev, Topology preserving edge contraction (1999).
+// https://research-explorer.ista.ac.at/record/3582
+
 
 namespace cumesh {
 
@@ -123,9 +128,11 @@ inline __device__ bool process_incident_tri(
     Vec3f new_normal = new_e1.cross(new_e2);
     float new_area = 0.5f * new_normal.norm();
 
-    // check flipping
-    if (old_normal.dot(new_normal) < 0.0f) {
-        return false; // invalid (flipped)
+    // Zero area is invalid too: accepting it produces NaN quadrics next round.
+    if (!(old_area > 0.0f) || !(new_area > 0.0f) ||
+        !isfinite(old_area) || !isfinite(new_area) ||
+        !(old_normal.dot(new_normal) > 0.0f)) {
+        return false;
     }
 
     // compute side lengths squared for shape metric
@@ -136,6 +143,73 @@ inline __device__ bool process_incident_tri(
     float term = 1.0f - fminf(fmaxf(shapeMetric, 0.0f), 1.0f);
     skinny_cost += term;
     num_tri += 1;
+    return true;
+}
+
+
+// get_edges() supplies sorted unique uint64 keys. Membership costs O(log E),
+// avoiding a quadratic intersection of two high-valence vertex stars.
+inline __device__ bool has_edge(const uint64_t* edges, int E, int a, int b) {
+    uint64_t key = (uint64_t(min(a, b)) << 32) | uint64_t(max(a, b));
+    int lo = 0, hi = E;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (edges[mid] < key) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < E && edges[lo] == key;
+}
+
+
+inline __device__ bool collapse_link_valid(
+    int a, int b, const int3* faces, const int* vert2face,
+    const int* offsets, const uint64_t* edges, int E,
+    const uint8_t* boundary
+) {
+    int opposite[2] = {-1, -1};
+    int edge_faces = 0;
+    for (int i = offsets[a]; i < offsets[a + 1]; ++i) {
+        int3 f = faces[vert2face[i]];
+        if (f.x != b && f.y != b && f.z != b) continue;
+        if (edge_faces == 2) return false; // nonmanifold edge
+        int v = (f.x != a && f.x != b) ? f.x :
+                ((f.y != a && f.y != b) ? f.y : f.z);
+        if (v == a || v == b || (edge_faces && opposite[0] == v)) return false;
+        opposite[edge_faces++] = v;
+    }
+    if (edge_faces != 1 && edge_faces != 2) return false;
+    // An interior chord between two boundary vertices merges/pinches boundary.
+    if (edge_faces == 2 && boundary[a] && boundary[b]) return false;
+    // Do not contract away the last triangle of a disk component.
+    if (edge_faces == 1 && offsets[a + 1] - offsets[a] == 1 &&
+        offsets[b + 1] - offsets[b] == 1) return false;
+
+    bool opposite_edge_in_a_link = false;
+    for (int i = offsets[a]; i < offsets[a + 1]; ++i) {
+        int3 f = faces[vert2face[i]];
+        int v[3] = {f.x, f.y, f.z};
+        for (int k = 0; k < 3; ++k) {
+            if (v[k] == a || v[k] == b || v[k] == opposite[0] ||
+                v[k] == opposite[1]) continue;
+            if (has_edge(edges, E, b, v[k])) return false;
+        }
+        if (edge_faces == 2 && f.x != b && f.y != b && f.z != b) {
+            bool has_first = f.x == opposite[0] || f.y == opposite[0] || f.z == opposite[0];
+            bool has_second = f.x == opposite[1] || f.y == opposite[1] || f.z == opposite[1];
+            opposite_edge_in_a_link |= has_first && has_second;
+        }
+    }
+    // The vertex-only condition is insufficient for a tetrahedron boundary:
+    // a common link edge would create duplicate triangles after contraction.
+    if (opposite_edge_in_a_link) {
+        for (int i = offsets[b]; i < offsets[b + 1]; ++i) {
+            int3 f = faces[vert2face[i]];
+            if (f.x == a || f.y == a || f.z == a) continue;
+            bool has_first = f.x == opposite[0] || f.y == opposite[0] || f.z == opposite[0];
+            bool has_second = f.x == opposite[1] || f.y == opposite[1] || f.z == opposite[1];
+            if (has_first && has_second) return false;
+        }
+    }
     return true;
 }
 
@@ -177,6 +251,12 @@ static __global__ void get_edge_collapse_cost_kernel(
     uint64_t e = edges[tid];
     int e0 = int(e >> 32);
     int e1 = int(e & 0xFFFFFFFF);
+
+    if (!collapse_link_valid(e0, e1, faces, vert2face, vert2face_offset,
+                             edges, E, vert_is_boundary)) {
+        edge_collapse_costs[tid] = INFINITY;
+        return;
+    }
 
     // get edge vertices
     Vec3f v0(vertices[e0]);
@@ -221,7 +301,8 @@ static __global__ void get_edge_collapse_cost_kernel(
     }
     cost += lambda_skinny * skinny_cost * edge_length2;
 
-    edge_collapse_costs[tid] = cost;
+    // Packed atomic ordering is defined only for finite nonnegative costs.
+    edge_collapse_costs[tid] = isfinite(cost) && cost >= 0.0f ? cost : INFINITY;
 }
 
 
@@ -264,9 +345,10 @@ void get_edge_collapse_cost(
  * @param V: the number of vertices
  * @param F: the number of faces
  * @param E: the number of edges
- * @param propagated_costs: the buffer for edge collapse costs propagated, shape (F)
+ * @param propagated_costs: the buffer for one-ring vertex costs, shape (V)
  */
 static __global__ void propagate_cost_kernel(
+    const int3* faces,
     const uint64_t* edges,
     const int* vert2face,
     const int* vert2face_offset,
@@ -284,14 +366,22 @@ static __global__ void propagate_cost_kernel(
     int e0 = int(e >> 32);
     int e1 = int(e & 0xFFFFFFFF);
 
+    if (!isfinite(edge_collapse_costs[tid])) return;
     uint64_t cost = pack_key_value_positive(tid, edge_collapse_costs[tid]);
 
-    // propagate cost to neighboring faces
+    // Own every vertex of both complete one-rings, including shared neighbors.
+    // Winners have disjoint stars, so cost-time links remain valid at commit.
     for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
-        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[vert2face[f]]), static_cast<unsigned long long>(cost));
+        int3 ids = faces[vert2face[f]];
+        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.x]), static_cast<unsigned long long>(cost));
+        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.y]), static_cast<unsigned long long>(cost));
+        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.z]), static_cast<unsigned long long>(cost));
     }
     for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
-        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[vert2face[f]]), static_cast<unsigned long long>(cost));
+        int3 ids = faces[vert2face[f]];
+        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.x]), static_cast<unsigned long long>(cost));
+        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.y]), static_cast<unsigned long long>(cost));
+        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[ids.z]), static_cast<unsigned long long>(cost));
     }
 }
 
@@ -306,14 +396,15 @@ void propagate_cost(
     size_t V = ctx.vertices.size;
     size_t F = ctx.faces.size;
     size_t E = ctx.edges.size;
-    ctx.propagated_costs.resize(F);
-    fill_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+    ctx.propagated_costs.resize(V);
+    fill_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.propagated_costs.ptr,
-        F,
+        V,
         std::numeric_limits<uint64_t>::max()
     );
     CUDA_CHECK(cudaGetLastError());
     propagate_cost_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        ctx.faces.ptr,
         ctx.edges.ptr,
         ctx.vert2face.ptr,
         ctx.vert2face_offset.ptr,
@@ -334,7 +425,7 @@ void propagate_cost(
  * @param vert2face: the buffer for neighboring face ids, shape (total_neighbor_face_cnt)
  * @param vert2face_offset: the buffer for neighboring face ids offset, shape (V+1)
  * @param edge_collapse_costs: the buffer for edge collapse costs, shape (E)
- * @param propagated_costs: the buffer for edge collapse costs propagated, shape (F)
+ * @param propagated_costs: the buffer for one-ring vertex costs, shape (V)
  * @param vert_is_boundary: the buffer for boundary vertex indicator, shape (V)
  * @param V: the number of vertices
  * @param F: the number of faces
@@ -363,7 +454,7 @@ static __global__ void collapse_edges_kernel(
     if (tid >= E) return;
 
     float cost = edge_collapse_costs[tid];
-    if (cost > collapse_thresh) return;
+    if (!isfinite(cost) || !(cost <= collapse_thresh)) return;
 
     // get edge
     uint64_t e = edges[tid];
@@ -372,10 +463,14 @@ static __global__ void collapse_edges_kernel(
     uint64_t pack = pack_key_value_positive(tid, cost);
 
     for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
-        if (propagated_costs[vert2face[f]] != pack) return;
+        int3 ids = faces[vert2face[f]];
+        if (propagated_costs[ids.x] != pack || propagated_costs[ids.y] != pack ||
+            propagated_costs[ids.z] != pack) return;
     }
     for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
-        if (propagated_costs[vert2face[f]] != pack) return;
+        int3 ids = faces[vert2face[f]];
+        if (propagated_costs[ids.x] != pack || propagated_costs[ids.y] != pack ||
+            propagated_costs[ids.z] != pack) return;
     }
 
     // collapse edge
