@@ -527,6 +527,9 @@ class CuMesh:
         except SimplificationFailure as error:
             self.last_simplification.update(status=error.code, remaining_faces=error.remaining_faces)
             raise
+        except Exception:
+            self.last_simplification.update(status="failed", remaining_faces=self.cu_mesh.num_faces())
+            raise
         finally:
             if verbose:
                 pbar.close()

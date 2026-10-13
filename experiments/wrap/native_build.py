@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -59,6 +59,8 @@ def build(out, identity, reuse=None):
     build_dir = out / "build"
     build_dir.mkdir()
     record["reused_objects"] = []
+    changed_objects = []
+    manual_reuse = False
     if reuse:
         previous = json.loads((reuse / "build.json").read_text())
         headers = {
@@ -74,10 +76,11 @@ def build(out, identity, reuse=None):
             for key in ("torch", "cuda", "arch", "nvcc", "c++")
         )
         if previous["status"] == "built" and same_headers and same_tools:
-            for name in (".ninja_log", ".ninja_deps"):
-                if (reuse / "build" / name).is_file():
-                    shutil.copy2(reuse / "build" / name, build_dir / name)
-            newest_source = max(p.stat().st_mtime for p in files)
+            # Mounted-source timestamps invalidate Ninja's dependency database
+            # across containers. Reuse hash-qualified objects explicitly, compile
+            # changed TUs with the recorded Ninja commands, then relink once.
+            shutil.copy2(reuse / "build" / "build.ninja", build_dir / "build.ninja")
+            manual_reuse = True
             for relative in sources:
                 key = "src/" + relative
                 object_name = Path(relative).stem + (
@@ -90,14 +93,16 @@ def build(out, identity, reuse=None):
                 ):
                     target = build_dir / object_name
                     shutil.copy2(old_object, target)
-                    os.utime(target, (max(time.time(), newest_source),) * 2)
                     record["reused_objects"].append(
                         {"source": key, "object": object_name, "sha256": sha(target)}
                     )
+                else:
+                    changed_objects.append(object_name)
             record["reuse_authority"] = {
                 "build_json_sha256": sha(reuse / "build.json"),
                 "path": str(reuse),
                 "rule": "identical_source_headers_toolchain_immutable_base_image",
+                "ninja_sha256": sha(build_dir / "build.ninja"),
             }
     # The unchanged xatlas extension is not rebuilt or used by reduction. Import
     # its package path without loading the old CuMesh _C (pybind type registry).
@@ -105,16 +110,41 @@ def build(out, identity, reuse=None):
     xatlas = next(installed.glob("_cumesh_xatlas*.so"))
     record["reused_xatlas"] = {"path": str(xatlas), "sha256": sha(xatlas)}
     try:
-        load(
-            name="_C",
-            sources=[str(root / "src" / path) for path in sources],
-            extra_cflags=["-O3", "-std=c++17"],
-            extra_cuda_cflags=["-O3", "-std=c++17"],
-            build_directory=str(build_dir),
-            verbose=True,
-            with_cuda=True,
-            is_python_module=False,
-        )
+        if manual_reuse:
+            record["executed_commands"] = []
+            for target in changed_objects + ["_C.so"]:
+                commands = subprocess.run(
+                    ["ninja", "-t", "commands", target],
+                    cwd=build_dir,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.splitlines()
+                # Object targets have one compiler command; the final dependency
+                # tree ends with the link command. Execute argv, never a shell.
+                arguments = shlex.split(commands[-1])
+                if target == "_C.so" and "-shared" not in arguments:
+                    raise ValueError("native_reuse_link_command_invalid")
+                if (
+                    "-o" not in arguments
+                    or arguments[arguments.index("-o") + 1] != target
+                ):
+                    raise ValueError("native_reuse_output_command_invalid")
+                print(json.dumps({"native_command": arguments}), flush=True)
+                subprocess.run(arguments, cwd=build_dir, check=True)
+                record["executed_commands"].append(arguments)
+            torch.ops.load_library(str(build_dir / "_C.so"))
+        else:
+            load(
+                name="_C",
+                sources=[str(root / "src" / path) for path in sources],
+                extra_cflags=["-O3", "-std=c++17"],
+                extra_cuda_cflags=["-O3", "-std=c++17"],
+                build_directory=str(build_dir),
+                verbose=True,
+                with_cuda=True,
+                is_python_module=False,
+            )
         package = out / "package" / "cumesh"
         shutil.copytree(root / "cumesh", package)
         binary = build_dir / "_C.so"
