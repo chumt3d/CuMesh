@@ -195,6 +195,7 @@ def wrap_surface(vertices: torch.Tensor, faces: torch.Tensor, *,
                 "limits": asdict(limits), "status": "running", "backend": "warp_lbvh_1.13.0",
                 "extraction": "freudenthal_marching_tetrahedra", "refinement": []}
     started = time.perf_counter()
+    wp.init()
     with torch.cuda.device(device):
         stream = wp.stream_from_torch(torch.cuda.current_stream(device))
         baseline = torch.cuda.memory_allocated(device)
