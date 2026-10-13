@@ -316,7 +316,7 @@ def _admit_projection(original, proposal, faces, rejected, batch_size, check):
                 | (normal.square().sum(1) <= 0)
                 | ((normal * reference).sum(1) <= 0)
             )
-        rejected[batch[bad].reshape(-1)] = True
+        rejected.index_fill_(0, batch[bad].reshape(-1), True)
     return torch.where(rejected[:, None], original, proposal)
 
 
