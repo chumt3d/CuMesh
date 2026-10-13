@@ -120,6 +120,11 @@ at most degree steps per vertex and O(F) aggregate walk work. Disconnected fans,
 invalid incidence and inconsistent orientation cannot supply collapse endpoints.
 The adjacency adds existing cache storage proportional to F/E; measured native
 peak includes it. Its E+1 scan sentinel remains allocated for fully open inputs.
+Face-to-edge lookup fills exactly three adjacency occurrences per triangle in
+O(F log E) work. Existing opaque CUB workspace supplies E integer cursors after
+the prefix scan is complete. This removes the high-valence star scan and remains
+memory-safe on repeated-index triangles, which the fan guard refuses. Edge-face
+pair ordering is unspecified; the oriented face-to-edge mapping is preserved.
 Local link/normal
 conditions do not certify global self-intersection or local wall thickness.
 

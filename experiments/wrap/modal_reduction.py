@@ -44,10 +44,19 @@ if modal.is_local():
     retries=0,
     volumes={"/evidence": volume},
 )
-def pilot(run_id: str, source_identity: dict):
+def pilot(run_id: str, source_identity: dict, build_id: str):
+    import os
     import subprocess
     import time
 
+    volume.reload()
+    build_dir = Path("/evidence/make-solid-wrap/native") / build_id
+    build = json.loads((build_dir / "build.json").read_text())
+    if build["status"] != "built":
+        raise ValueError("root_fixed_native_build_required")
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = build["package_path"] + ":/opt/wrap"
+    environment["WRAP_NATIVE_BUILD_JSON"] = str(build_dir / "build.json")
     directory = Path("/evidence/make-solid-wrap") / run_id
     directory.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
@@ -73,6 +82,7 @@ def pilot(run_id: str, source_identity: dict):
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 timeout=60,
+                env=environment,
             )
         rows.append({"name": "sample_controls", "exit_code": control.returncode})
         volume.commit()
@@ -97,6 +107,7 @@ def pilot(run_id: str, source_identity: dict):
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         timeout=250,
+                        env=environment,
                     )
                     rows.append({"name": name, "exit_code": process.returncode})
                 except subprocess.TimeoutExpired:
@@ -127,9 +138,9 @@ def pilot(run_id: str, source_identity: dict):
 
 
 @app.local_entrypoint()
-def main(run_id: str, source_identity: str):
+def main(run_id: str, source_identity: str, build_id: str):
     identity = json.loads(Path(source_identity).read_text())
-    call = pilot.spawn(run_id, identity)
+    call = pilot.spawn(run_id, identity, build_id)
     print(
         json.dumps({"appId": app.app_id, "callId": call.object_id, "runId": run_id}),
         flush=True,

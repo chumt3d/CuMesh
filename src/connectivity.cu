@@ -187,41 +187,38 @@ void CuMesh::get_edges() {
 static __global__ void get_edge_face_adjacency_kernel(
     const int3* faces,
     const uint64_t* edges,
-    const int* edge2face_cnt,
-    const int* vert2face,
-    const int* vert2face_offset,
     const int* edge2face_offset,
-    const int E,
+    const int E, const int F,
+    int* edge_cursors,
     int* edge2face,
     int3* face2edge
 ) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= E) return;
-
-    // get edge
-    uint64_t e = edges[tid];
-    int e0 = int(e >> 32);
-    int e1 = int(e & 0xFFFFFFFF);
-
-    // assign connectivity
-    int ptr = edge2face_offset[tid];
-    for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
-        int fid = vert2face[f];
-        int3 f_vids = faces[fid];
-        if (f_vids.x == e1 || f_vids.y == e1 || f_vids.z == e1) {
-            // this face contains the edge
-            edge2face[ptr] = fid;
-            ptr++;
-            // fill face2edge
-            if (f_vids.x == e0 && f_vids.y == e1 || f_vids.x == e1 && f_vids.y == e0) {
-                face2edge[fid].x = tid;
-            } else if (f_vids.y == e0 && f_vids.z == e1 || f_vids.y == e1 && f_vids.z == e0) {
-                face2edge[fid].y = tid;
-            } else if (f_vids.z == e0 && f_vids.x == e1 || f_vids.z == e1 && f_vids.x == e0) {
-                face2edge[fid].z = tid;
-            }
+    int fid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (fid >= F) return;
+    int3 face = faces[fid];
+    int vertices[3] = {face.x, face.y, face.z};
+    int ids[3];
+    // Exactly one write per face edge occurrence, matching get_edges()'s RLE
+    // counts even for repeated-index triangles. O(F log E), no hub-star scan.
+    for (int corner = 0; corner < 3; ++corner) {
+        int a = vertices[corner], b = vertices[(corner + 1) % 3];
+        uint64_t key = (uint64_t(min(a, b)) << 32) | uint64_t(max(a, b));
+        int lo = 0, hi = E;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (edges[mid] < key) lo = mid + 1;
+            else hi = mid;
         }
+        // Every face edge was emitted by get_edges on this same snapshot.
+        if (lo >= E || edges[lo] != key) {
+            __trap(); // fail the CUDA operation on an inconsistent snapshot
+            return;
+        }
+        ids[corner] = lo;
+        int slot = atomicAdd(edge_cursors + lo, 1);
+        edge2face[edge2face_offset[lo] + slot] = fid;
     }
+    face2edge[fid] = {ids[0], ids[1], ids[2]};
 }
 
 
@@ -262,14 +259,16 @@ void CuMesh::get_edge_face_adjacency() {
     this->face2edge.resize(F);
 
     // get edge-face adjacency
-    get_edge_face_adjacency_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+    // Scan scratch is no longer live after the D2H offset synchronization.
+    // Reuse that owned opaque workspace for E integer cursors.
+    this->cub_temp_storage.resize(E * sizeof(int));
+    CUDA_CHECK(cudaMemsetAsync(this->cub_temp_storage.ptr, 0, E * sizeof(int), stream));
+    get_edge_face_adjacency_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->faces.ptr,
         this->edges.ptr,
-        this->edge2face_cnt.ptr,
-        this->vert2face.ptr,
-        this->vert2face_offset.ptr,
         this->edge2face_offset.ptr,
-        E,
+        E, F,
+        reinterpret_cast<int*>(this->cub_temp_storage.ptr),
         this->edge2face.ptr,
         this->face2edge.ptr
     );

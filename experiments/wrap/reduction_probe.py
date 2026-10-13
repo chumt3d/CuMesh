@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 import subprocess
 import threading
 import time
@@ -48,6 +49,20 @@ def backend_identity():
         result["direct_url"] = dist.read_text("direct_url.json")
     except importlib.metadata.PackageNotFoundError:
         result["package_version"] = "metadata_unavailable"
+    if os.environ.get("WRAP_NATIVE_BUILD_JSON"):
+        manifest = Path(os.environ["WRAP_NATIVE_BUILD_JSON"])
+        receipt = json.loads(manifest.read_text())
+        if (
+            receipt["status"] != "built"
+            or receipt["native_sha256"] != result["native"]["sha256"]
+            or receipt["python_sha256"] != result["python"]["sha256"]
+        ):
+            raise ValueError("native_build_binding_mismatch")
+        result.update(
+            binary_source_correspondence="sha_bound_to_dev_build_receipt",
+            build_manifest_sha256=digest(manifest),
+            build_source=receipt["source"],
+        )
     return result
 
 

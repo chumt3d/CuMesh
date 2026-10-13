@@ -123,6 +123,28 @@ def fixture(name):
         vertices, faces = fixture("boundary_disk")
         vertices[:, 2] = vertices[:, 0] + vertices[:, 1]
         return vertices + np.float32(100000), faces
+    if name == "disconnected_fan":
+        # Two nonterminal convex bipyramids in opposite z half-spaces meet only
+        # at vertex0. Only (0,1) is short; its link within the first fan is legal,
+        # so refusing it specifically exercises the disconnected endpoint fan.
+        first_v, first_f = _orient_closed(
+            *_arrays(
+                ((0, 0, 0), (0, 0, 0.02), (2, 0, 0.02), (0, 2, 0.02), (0.5, 0.5, 2)),
+                ((4, 1, 2), (4, 2, 3), (4, 3, 1), (0, 2, 1), (0, 3, 2), (0, 1, 3)),
+            )
+        )
+        second_v, second_f = _orient_closed(
+            *_arrays(
+                ((-2, -1, -2), (1, -2, -2), (1, 2, -2), (0, 0, 0), (0, 0, -4)),
+                ((3, 0, 1), (3, 1, 2), (3, 2, 0), (4, 1, 0), (4, 2, 1), (4, 0, 2)),
+            )
+        )
+        remap = np.array((5, 6, 7, 0, 8), dtype=np.int32)
+        return np.concatenate((first_v, second_v[[0, 1, 2, 4]])), np.concatenate(
+            (first_f, remap[second_f])
+        )
+    if name == "repeated_index":
+        return _arrays(((0, 0, 0), (1, 0, 0)), ((0, 1, 1),))
     raise ValueError(name)
 
 
@@ -302,6 +324,8 @@ def execute(out, mode, selected):
         "boundary_chord",
         "last_triangle",
         "offset_disk",
+        "disconnected_fan",
+        "repeated_index",
     )
     if selected != "all":
         names = (selected,)
@@ -322,7 +346,7 @@ def execute(out, mode, selected):
             "contract_passed": False,
         }
         try:
-            if name != "nan_no_commit":
+            if name not in ("nan_no_commit", "disconnected_fan", "repeated_index"):
                 assert valid_surface(
                     initial,
                     name
@@ -366,7 +390,13 @@ def execute(out, mode, selected):
             else:
                 threshold = (
                     0.01
-                    if name in ("invalid_equator", "boundary_disk", "boundary_chord")
+                    if name
+                    in (
+                        "invalid_equator",
+                        "boundary_disk",
+                        "boundary_chord",
+                        "disconnected_fan",
+                    )
                     else 1000.0
                 )
                 row["operation"] = {
@@ -401,7 +431,27 @@ def execute(out, mode, selected):
             )
             final = audit(output_vertices, output_faces)
             row.update(final=final, output=_hash_arrays(output_vertices, output_faces))
-            if name == "nan_no_commit":
+            if name == "repeated_index":
+                row["contract_passed"] = bool(
+                    np.array_equal(output_vertices, vertices)
+                    and np.array_equal(output_faces, faces)
+                    and final["zero_area_faces"] == 1
+                )
+                row["invalid_geometry_disclosure"] = (
+                    "repeated-index input retained without unsafe adjacency writes"
+                )
+            elif name == "disconnected_fan":
+                row["contract_passed"] = bool(
+                    initial["invalid_vertex_links"] == 1
+                    and initial["nonmanifold_edges"] == 0
+                    and np.array_equal(output_vertices, vertices)
+                    and np.array_equal(output_faces, faces)
+                    and final["invalid_vertex_links"] == 1
+                )
+                row["invalid_geometry_disclosure"] = (
+                    "pinched input retained; never a valid printable surface"
+                )
+            elif name == "nan_no_commit":
                 row["contract_passed"] = bool(
                     np.array_equal(output_vertices, vertices, equal_nan=True)
                     and np.array_equal(output_faces, faces)
@@ -472,6 +522,8 @@ if __name__ == "__main__":
             "boundary_chord",
             "last_triangle",
             "offset_disk",
+            "disconnected_fan",
+            "repeated_index",
         ),
         default="all",
     )
