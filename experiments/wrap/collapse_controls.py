@@ -91,9 +91,17 @@ def _bipyramid(short_equator=False):
 def fixture(name):
     if name == "cube72":
         return cube_lattice()
+    if name == "zero_plane_budget":
+        return fixture("boundary_disk")
     if name == "error_first_cube":
         return cube_lattice(16)
-    if name in ("terminal_tetra", "terminal_public", "error_floor_tetra"):
+    if name in (
+        "terminal_tetra",
+        "terminal_public",
+        "error_floor_tetra",
+        "quadric_cross_stream",
+        "quadric_alignment",
+    ):
         return _orient_closed(
             *_arrays(
                 ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)),
@@ -330,6 +338,9 @@ def execute(out, mode, selected):
         "repeated_index",
         "error_floor_tetra",
         "error_first_cube",
+        "zero_plane_budget",
+        "quadric_cross_stream",
+        "quadric_alignment",
     )
     if selected != "all":
         names = (selected,)
@@ -359,6 +370,7 @@ def execute(out, mode, selected):
                         "boundary_chord",
                         "last_triangle",
                         "offset_disk",
+                        "zero_plane_budget",
                     ),
                 ), initial
             mesh = cumesh.CuMesh()
@@ -368,7 +380,55 @@ def execute(out, mode, selected):
             )
             operation_start = time.monotonic()
             typed_stop = None
-            if name in ("error_floor_tetra", "error_first_cube"):
+            if name == "quadric_alignment":
+                invalid = torch.empty(
+                    12 * len(vertices) + 1, dtype=torch.float64, device="cuda"
+                )[1:].view(len(vertices), 12)
+                try:
+                    mesh.cu_mesh.simplify_step_accumulated(
+                        invalid, 0.01, 0.001, 0.001, 0.001, False
+                    )
+                    raise AssertionError("misaligned public input was accepted")
+                except RuntimeError as error:
+                    if "16-byte aligned" not in str(error):
+                        raise
+                row["misaligned_input_rejected"] = True
+            elif name == "quadric_cross_stream":
+                # Public output must outlive pending caller-stream reads after
+                # release, even while the canonical stream reuses allocations.
+                canonical = torch.cuda.Stream()
+                caller = torch.cuda.Stream()
+                with torch.cuda.stream(canonical):
+                    mesh.init(
+                        torch.tensor(vertices, device="cuda"),
+                        torch.tensor(faces, device="cuda"),
+                    )
+                retained = []
+                for _ in range(4):
+                    with torch.cuda.stream(caller):
+                        q = mesh.cu_mesh.initial_simplification_quadrics()
+                        _, _, next_q = mesh.cu_mesh.simplify_step_accumulated(
+                            q, 0.01, 0.001, 0.000001, 0.000001, False
+                        )
+                        torch.cuda._sleep(5_000_000)
+                        retained.extend((q.clone(), next_q.clone()))
+                        del q, next_q
+                    with torch.cuda.stream(canonical):
+                        overwrite = torch.empty(
+                            (len(vertices), 12), dtype=torch.float64, device="cuda"
+                        ).fill_(float("nan"))
+                        del overwrite
+                torch.cuda.synchronize()
+                row["cross_stream_retained_finite"] = all(
+                    bool(torch.isfinite(q).all().item())
+                    and bool((q[:, 10] > 0).all().item())
+                    for q in retained
+                )
+                del retained
+            elif name == "zero_plane_budget":
+                mesh.simplify(1, options={"max_error": 0.001})
+                row["native_steps"] = mesh.last_simplification
+            elif name in ("error_floor_tetra", "error_first_cube"):
                 # Real public admission/stop behavior, not an API/source check.
                 # A tiny error budget must stop normally without forcing target.
                 row["operation"] = {
@@ -485,9 +545,29 @@ def execute(out, mode, selected):
                         "boundary_chord",
                         "last_triangle",
                         "offset_disk",
+                        "zero_plane_budget",
                     ),
                 )
-                if name == "error_floor_tetra":
+                if name == "quadric_alignment":
+                    valid = (
+                        valid
+                        and row["misaligned_input_rejected"]
+                        and np.array_equal(output_vertices, vertices)
+                        and np.array_equal(output_faces, faces)
+                    )
+                elif name == "quadric_cross_stream":
+                    valid = (
+                        valid
+                        and row["cross_stream_retained_finite"]
+                        and len(output_faces) == 4
+                    )
+                elif name == "zero_plane_budget":
+                    valid = (
+                        valid
+                        and len(output_faces) == 1
+                        and row["native_steps"]["status"] == "target_reached"
+                    )
+                elif name == "error_floor_tetra":
                     valid = (
                         valid
                         and len(output_faces) == 4
@@ -558,6 +638,9 @@ if __name__ == "__main__":
             "repeated_index",
             "error_floor_tetra",
             "error_first_cube",
+            "zero_plane_budget",
+            "quadric_cross_stream",
+            "quadric_alignment",
         ),
         default="all",
     )
