@@ -1,0 +1,66 @@
+# GPU exterior WRAP candidate
+
+`cumesh_wrap.wrap_surface(V,F,settings=...,limits=...)` accepts contiguous CUDA
+float32 positions **already in print millimetres**, and CUDA int32 triangles.
+It returns those same canonical array types and a small evidence leaf. Scaling,
+cleanup, fidelity, user disclosure, STL/3MF writers and final-byte qualification
+belong to MAKE-SOLID. `WrapFailure` preserves typed cause/evidence and emits no
+partial, pruned or reduced-resolution mesh. This is a candidate, not a released
+Make-printable engine.
+
+The FDM evaluation profile uses 0.5 mm one-sided offset, voxel <=0.25 mm,
+and MAKE-SOLID's 0.4 mm minimum full wall. Padding is offset+two voxels per side.
+Resolution is the smallest power of two >= padded extent/requested voxel, at
+least upstream's 32. Actual voxels can be smaller. Projection ratio 0.1 is an
+explicit **experimental setting**, not an adopted policy. Its movement is capped
+by offset-minThickness/2-sqrt(3)*actualVoxel/2 and restricted to the original
+lattice edge. That preserves the tetra cell containing each surface patch and
+bounds distance from the source. The bound assumes an exact UDF; Warp's source
+sliver omission means final product thickness/fidelity still must be measured.
+
+## Borrowed source and deliberate changes
+
+- CuMesh MIT upstream `12289e1062f0603f2f0d0771b02e1395d247f26f`:
+  `cumesh/remeshing.py` octree refinement around UDF-offset, cube coordinates,
+  power-of-two level expansion, optional barycentric closest-point projection.
+  Use exact sqrt(3)/2 instead of rounded 0.87; Torch unique replaces the CUDA
+  sparse hash/corner ordering. No output/order/numerical equivalence claim.
+- Owned fork pilot `3d357b367d6b736baf7eb7cc702c0ac34029f345`:
+  `experiments/narrow_band/.../warp_bvh.py` is copied unchanged. Warp1.13.0
+  LBVH/no-sign distance remains the default. `cuBVH` can be injected using the
+  same public unsigned_distance shape, device and barycentric contract.
+  The pilot's CUDA hash/simple-dual-contour code was read but is not copied.
+- Warp Apache-2.0 source `NVIDIA/warp` v1.13.0 supplies GPU BVH/traversal and
+  atomics. No Warp implementation code is copied. Preserve its distribution
+  notices with the dependency. Warp drops sufficiently sliver/degenerate faces;
+  equal-distance ties/float arithmetic differ from cuBVH. No backend parity claim.
+- Exterior reachability and six-tetra extraction are new Tiny3D code, using
+  the Freudenthal subdivision (global 0->7 body diagonal). Sixteen tetra cases
+  are constructed from sign partitions, not copied from another implementation.
+  The flood graph includes the exact 14 tetra-lattice edge directions. Filled
+  free regions become negative, eliminating internal UDF shells. A single output
+  component is required by default; distant pieces fail instead of being erased.
+- No CGAL/GPL source, library or executable is imported by this package. CGAL
+  alpha-wrap may be measured separately as reference only.
+
+The dense flood state+two queues use 12*(R+1)^3 bytes. Sparse refinement and
+surface extraction add storage proportional to active band cells/corners and
+output triangles. Tetra extraction is batched; global output edge dedup remains
+proportional to the complete surface. Admission checks driver-free bytes plus a
+256 MiB workspace reserve and a caller-specified CUDA envelope (default18 GiB on
+L4). These safeguards are estimates, **not a measured peak bound**. No consumer
+pricing is embedded. Timings/driver memory and final product acceptance are
+separate evidence. The numerical sign epsilon is float32 epsilon*domain scale.
+
+Every success checks edge incidence/direction, exact position coincidence,
+connectivity and positive signed volume. Conforming tetra extraction with strictly
+nonzero grid values supplies closed vertex links by construction; final exact
+artifact validators must independently confirm manifoldness/self-intersection
+and minimum wall. Projection never moves a crossing outside its shared grid edge.
+Apertures below the wrapping scale and enclosed cavities may be filled and must
+be disclosed. Open concavities reachable from the domain remain empty.
+
+Install this isolated Python distribution through Socket Firewall with existing
+Torch>=2.5 and `warp-lang==1.13.0`; no CUDA/NVCC extension build is required. The
+parent production CuMesh distribution is untouched. Source base is the exact
+parent gitlink31e62e1d1adcb4cb7132989137d88aa5042fae54.
