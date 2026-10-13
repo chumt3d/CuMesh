@@ -374,10 +374,18 @@ def execute(out, mode, selected):
                     ),
                 ), initial
             mesh = cumesh.CuMesh()
-            mesh.init(
-                torch.from_numpy(vertices.copy()).to("cuda"),
-                torch.from_numpy(faces.copy()).to("cuda"),
-            )
+            if name == "quadric_cross_stream":
+                canonical = torch.cuda.Stream()
+                with torch.cuda.stream(canonical):
+                    mesh.init(
+                        torch.tensor(vertices, device="cuda"),
+                        torch.tensor(faces, device="cuda"),
+                    )
+            else:
+                mesh.init(
+                    torch.from_numpy(vertices.copy()).to("cuda"),
+                    torch.from_numpy(faces.copy()).to("cuda"),
+                )
             operation_start = time.monotonic()
             typed_stop = None
             if name == "quadric_alignment":
@@ -396,13 +404,7 @@ def execute(out, mode, selected):
             elif name == "quadric_cross_stream":
                 # Public output must outlive pending caller-stream reads after
                 # release, even while the canonical stream reuses allocations.
-                canonical = torch.cuda.Stream()
                 caller = torch.cuda.Stream()
-                with torch.cuda.stream(canonical):
-                    mesh.init(
-                        torch.tensor(vertices, device="cuda"),
-                        torch.tensor(faces, device="cuda"),
-                    )
                 retained = []
                 for _ in range(4):
                     with torch.cuda.stream(caller):
