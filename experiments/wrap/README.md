@@ -85,6 +85,13 @@ snapshot, with proposal spacing halved (four times the target). The last passing
 mesh is retained. The existing native call has no cancellation hook; the pilot
 uses a hard subprocess deadline and preserves immutable volume-stored raw input.
 
+Reduction v2 keeps positions in the caller's final float32 print-mm frame during
+every native update. Only the initial cost threshold is scaled by the squared
+100 mm cost unit. It does not normalize and restore positions: that float32
+affine round trip merged distinct normalized vertices in the palm v1 pilot.
+Callers prepare their fixed source-to-print transform before WRAP and do not
+recenter/recast the candidate after its geometry predicates.
+
 Each candidate checks exact edge incidence/direction, exact position coincidence,
 duplicate/degenerate faces, components and positive volume per component, then
 streams every referenced vertex and every face centroid through two-sided Warp

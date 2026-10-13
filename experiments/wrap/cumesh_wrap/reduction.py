@@ -16,7 +16,10 @@ from .deviation import measure_bidirectional_deviation
 from .engine import WrapFailure, _component_labels
 from .warp_bvh import validate_mesh
 
-REDUCTION_POLICY_VERSION = "tiny3d.wrap.sampled-density.v1"
+REDUCTION_POLICY_VERSION = "tiny3d.wrap.sampled-density.v2"
+# Exact CuMesh 31e62e1d Python default. QEM and edge-length costs have units
+# length squared; rescale the scalar threshold, never the stored positions.
+CUMESH_INITIAL_NORMALIZED_THRESHOLD = 1e-8
 
 
 @dataclass(frozen=True)
@@ -25,8 +28,7 @@ class ReductionSettings:
     # to sampled raw-wrap/candidate deviation. This evaluation profile uses 1/4.
     deviation_fraction: float = 0.25
     approximate_target_face_count: int | None = None
-    # CuMesh's checked Python API is normalized-coordinate QEM, not millimetres.
-    normalization_mm: float = 100.0
+    cost_normalization_mm: float = 100.0
     max_cuda_bytes: int = 18 * 1024**3
 
 
@@ -122,6 +124,19 @@ def reduce_surface(
         raise ValueError("source_tolerance_mm must be positive and finite")
     if not 0 < settings.deviation_fraction < 1:
         raise ValueError("deviation_fraction must be inside (0,1)")
+    if (
+        not math.isfinite(settings.cost_normalization_mm)
+        or settings.cost_normalization_mm <= 0
+    ):
+        raise ValueError("cost_normalization_mm must be positive and finite")
+    initial_threshold = (
+        CUMESH_INITIAL_NORMALIZED_THRESHOLD * settings.cost_normalization_mm**2
+    )
+    if (
+        not math.isfinite(initial_threshold)
+        or initial_threshold > torch.finfo(torch.float32).max
+    ):
+        raise ValueError("initial QEM threshold must be representable as float32")
     if settings.approximate_target_face_count is not None and (
         not isinstance(settings.approximate_target_face_count, int)
         or settings.approximate_target_face_count <= 0
@@ -178,6 +193,10 @@ def reduce_surface(
         "model_triangle_area_mm2": triangle_area,
         "density_target_faces": density_target,
         "requested_approximate_target_faces": settings.approximate_target_face_count,
+        "position_frame": "unchanged_input_print_mm",
+        "position_dtype": "float32",
+        "cost_normalization_mm": settings.cost_normalization_mm,
+        "initial_qem_threshold_mm2": initial_threshold,
         "raw_vertices": len(raw_vertices),
         "raw_faces": len(raw_faces),
         "attempts": [],
@@ -185,7 +204,6 @@ def reduce_surface(
         "qualification": "candidate_only_final_product_gates_required",
     }
     selected_v, selected_f = raw_vertices, raw_faces
-    center = (raw_vertices.amin(dim=0) + raw_vertices.amax(dim=0)) / 2
     for attempt in range(2):
         # Halving proposal spacing quadruples area-derived density. It is the
         # single permitted correction, never an iterative target-count search.
@@ -199,10 +217,10 @@ def reduce_surface(
         phase(f"qem_{attempt + 1}")
         qem_started = time.monotonic()
         mesh = cumesh.CuMesh()
-        mesh.init(
-            ((raw_vertices - center) / settings.normalization_mm).contiguous(),
-            raw_faces,
-        )
+        # Native validity checks and position updates see the exact float32
+        # coordinates delivered to the consumer. An affine float32 round trip
+        # after those checks can merge previously distinct positions.
+        mesh.init(raw_vertices, raw_faces)
         # Upstream Python/native defaults retained. The subprocess caller supplies
         # a hard deadline around this native API, which has no cancellation hook.
         qem_stop = None
@@ -210,7 +228,10 @@ def reduce_surface(
             mesh.simplify(
                 target,
                 verbose=False,
-                options={"deadline_monotonic": deadline_monotonic},
+                options={
+                    "deadline_monotonic": deadline_monotonic,
+                    "thresh": initial_threshold,
+                },
             )
         except cumesh.SimplificationFailure as error:
             qem_stop = {
@@ -235,7 +256,7 @@ def reduce_surface(
         # Unreferenced positions are not mesh components and carry no geometry.
         mesh.remove_unreferenced_vertices()
         cv, cf = mesh.read()
-        cv = (cv * settings.normalization_mm + center).contiguous()
+        cv = cv.contiguous()
         cf = cf.int().contiguous()
         torch.cuda.synchronize(device)
         del mesh
