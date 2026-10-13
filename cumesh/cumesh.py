@@ -8,6 +8,8 @@ from tqdm import tqdm
 from .xatlas import Atlas
 from . import _C
 
+SIMPLIFICATION_POLICY_VERSION = "cumesh.simplicial-link-and-single-fan.v1"
+
 
 class SimplificationFailure(RuntimeError):
     """Target/deadline not reached; the current mesh remains owned and readable."""

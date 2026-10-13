@@ -17,6 +17,8 @@ import warp as wp
 
 from .warp_bvh import WarpUnsignedDistanceBVH, validate_mesh
 
+WRAP_POLICY_VERSION = "tiny3d.wrap.fdm-evaluation.v1"
+
 
 class WrapFailure(RuntimeError):
     """No publishable mesh; preserve caller's input and diagnostics."""
@@ -250,6 +252,7 @@ def wrap_surface(
     device = vertices.device
     evidence = {
         "schema": "tiny3d.gpu-wrap.v1",
+        "policy_version": WRAP_POLICY_VERSION,
         "settings": asdict(settings),
         "limits": asdict(limits),
         "status": "running",

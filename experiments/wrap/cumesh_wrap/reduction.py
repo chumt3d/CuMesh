@@ -16,6 +16,8 @@ from .deviation import measure_bidirectional_deviation
 from .engine import WrapFailure, _component_labels
 from .warp_bvh import validate_mesh
 
+REDUCTION_POLICY_VERSION = "tiny3d.wrap.sampled-density.v1"
+
 
 @dataclass(frozen=True)
 class ReductionSettings:
@@ -167,6 +169,7 @@ def reduce_surface(
         len(raw_faces), settings.approximate_target_face_count or density_target
     )
     evidence = {
+        "policy_version": REDUCTION_POLICY_VERSION,
         "source_tolerance_mm": source_tolerance_mm,
         "sample_deviation_budget_mm": budget,
         "deviation_fraction": settings.deviation_fraction,
