@@ -331,6 +331,11 @@ def wrap_surface(
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     """Return canonical CUDA arrays and small evidence leaf, or WrapFailure.
 
+    Input precondition: derive the final local print frame in float64, including
+    centering/scaling, before the caller's single float32 position cast. Large
+    absolute world coordinates can trigger wrap_extraction_precision_invalid
+    or wrap_grid_precision_limit; those typed refusals preserve the input.
+    The engine does not recenter and restore already-rounded world positions.
     Publication requires the executor's final-byte validation and fidelity gates.
     A failure emits no reduced-resolution, cropped, or component-pruned output.
     """
