@@ -91,7 +91,9 @@ def _bipyramid(short_equator=False):
 def fixture(name):
     if name == "cube72":
         return cube_lattice()
-    if name in ("terminal_tetra", "terminal_public"):
+    if name == "error_first_cube":
+        return cube_lattice(16)
+    if name in ("terminal_tetra", "terminal_public", "error_floor_tetra"):
         return _orient_closed(
             *_arrays(
                 ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)),
@@ -326,6 +328,8 @@ def execute(out, mode, selected):
         "offset_disk",
         "disconnected_fan",
         "repeated_index",
+        "error_floor_tetra",
+        "error_first_cube",
     )
     if selected != "all":
         names = (selected,)
@@ -364,7 +368,19 @@ def execute(out, mode, selected):
             )
             operation_start = time.monotonic()
             typed_stop = None
-            if name in ("cube72", "terminal_public", "offset_disk"):
+            if name in ("error_floor_tetra", "error_first_cube"):
+                # Real public admission/stop behavior, not an API/source check.
+                # A tiny error budget must stop normally without forcing target.
+                row["operation"] = {
+                    "api": "CuMesh.simplify",
+                    "max_error": 0.001,
+                    "target_faces": 2 if name == "error_floor_tetra" else None,
+                }
+                mesh.simplify(
+                    row["operation"]["target_faces"], options={"max_error": 0.001}
+                )
+                row["native_steps"] = mesh.last_simplification
+            elif name in ("cube72", "terminal_public", "offset_disk"):
                 target = (
                     len(faces) // 5
                     if name == "cube72"
@@ -471,9 +487,25 @@ def execute(out, mode, selected):
                         "offset_disk",
                     ),
                 )
-                if name == "cube72":
+                if name == "error_floor_tetra":
+                    valid = (
+                        valid
+                        and len(output_faces) == 4
+                        and row["native_steps"]["status"]
+                        == "error_or_topology_limit_reached"
+                        and np.array_equal(output_vertices, vertices)
+                        and np.array_equal(output_faces, faces)
+                    )
+                elif name == "error_first_cube":
+                    valid = (
+                        valid
+                        and 4 <= len(output_faces) < len(faces)
+                        and row["native_steps"]["status"]
+                        == "error_or_topology_limit_reached"
+                    )
+                elif name == "cube72":
                     valid = valid and 4 <= len(output_faces) <= target
-                elif name in ("terminal_tetra", "terminal_public"):
+                elif name in ("terminal_tetra", "terminal_public", "error_floor_tetra"):
                     valid = valid and len(output_faces) == 4
                     if name == "terminal_public":
                         valid = valid and typed_stop is not None
@@ -524,6 +556,8 @@ if __name__ == "__main__":
             "offset_disk",
             "disconnected_fan",
             "repeated_index",
+            "error_floor_tetra",
+            "error_first_cube",
         ),
         default="all",
     )

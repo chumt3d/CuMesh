@@ -77,20 +77,22 @@ binary source correspondence from a package name.
 
 The Standard pilot allocates one quarter of the existing product's source
 tolerance (`8*0.001*source_bbox_diagonal_mm`) to sampled wrap/candidate deviation.
-The proposed target is raw surface area divided by the area of an equilateral
-triangle with circumradius equal to that budget. This density model does not
-bound QEM error. An advanced approximate target can replace the density target.
-There is one `simplify` call and at most one corrective call from a fresh raw
-snapshot, with proposal spacing halved (four times the target). The last passing
-mesh is retained. The existing native call has no cancellation hook; the pilot
-uses a hard subprocess deadline and preserves immutable volume-stored raw input.
+Standard uses one accumulated error-first QEM pass. Original face planes are
+weighted by square root of double area and accumulated in float64; the metric
+is weighted RMS distance to those planes in mm. An optimal LDL proposal (or
+geometry-valid endpoint/segment fallback) rounds to actual stored float32 before
+all native predicates; commit uses that identical proposal. The named error
+cap never escalates to force a count. An optional advanced approximate count
+stops further reduction, and the achieved count/error are disclosed.
 
-Reduction v2 keeps positions in the caller's final float32 print-mm frame during
-every native update. Only the initial cost threshold is scaled by the squared
-100 mm cost unit. It does not normalize and restore positions: that float32
-affine round trip merged distinct normalized vertices in the palm v1 pilot.
-Callers prepare their fixed source-to-print transform before WRAP and do not
-recenter/recast the candidate after its geometry predicates.
+Reduction v3 never normalizes/restores positions or recenters outputs. The caller
+prepares its fixed source-to-print matrix before WRAP. The metric is an admission
+proxy, not a sampled or Hausdorff certificate: qualification streams the actual
+raw/candidate samples and keeps RAW if any final gate is failed or unresolved.
+No density-derived target or corrective retry remains. Native state consists of
+per-call CUDA float64 Tensor quadrics, merged/compacted each round; cache release
+cannot discard the original planes. The native Python deadline acts between
+steps and the integration caller retains its outer process deadline.
 
 Each candidate checks exact edge incidence/direction, exact position coincidence,
 duplicate/degenerate faces, components and positive volume per component, then
@@ -104,7 +106,7 @@ Torch allocation peaks alone omit native allocations.
 
 ## Root CuMesh collapse correction (controller371)
 
-Policy v2 builds a deterministic maximal batch over one immutable cost/CSR
+Policy v3 retains v2's a deterministic maximal batch over one immutable cost/CSR
 snapshot. Each selection pass retains packed `(cost, edge ID)` priority, reserves
 chosen complete stars, removes conflicting candidates, then repeats on the
 remaining candidates. Geometry commits begin only after all selection passes.
