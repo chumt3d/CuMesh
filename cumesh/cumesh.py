@@ -529,6 +529,7 @@ class CuMesh:
                 if error_limit is None and deleted/faces<1e-2:
                     threshold=min(maximum,max(threshold*10,torch.finfo(torch.float32).tiny))
                 faces=next_faces
+            self.last_simplification["max_cluster_radius"]=float(quadrics[:,11].max().item())
         except SimplificationFailure as error:
             self.last_simplification.update(status=error.code,remaining_faces=error.remaining_faces)
             raise

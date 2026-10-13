@@ -443,7 +443,8 @@ def execute(out, mode, selected):
                     "target_faces": 2 if name == "error_floor_tetra" else None,
                 }
                 mesh.simplify(
-                    row["operation"]["target_faces"], options={"max_error": 0.001}
+                    row["operation"]["target_faces"],
+                    options={"max_error": row["operation"]["max_error"]},
                 )
                 row["native_steps"] = mesh.last_simplification
             elif name in ("cube72", "terminal_public", "offset_disk"):
