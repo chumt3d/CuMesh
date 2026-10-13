@@ -605,6 +605,8 @@ public:
      * @return A tuple of the number of vertices and the number of faces after simplification.
      */
     std::tuple<int, int> simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing=false);
+    torch::Tensor initial_simplification_quadrics();
+    std::tuple<int,int,torch::Tensor> simplify_step_accumulated(const torch::Tensor& quadrics,float lambda_edge_length,float lambda_skinny,float threshold,double max_error_squared,bool timing=false);
 
 
     // Atlasing functions

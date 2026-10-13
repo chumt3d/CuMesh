@@ -53,15 +53,16 @@ static __global__ void get_qem_kernel(
     QEM v_qem;
     for (int f = vert2face_offset[tid]; f < vert2face_offset[tid+1]; f++) {
         int3 f_vids = faces[vert2face[f]];
-        Vec3f f_v0(vertices[f_vids.x]);
-        Vec3f e1(vertices[f_vids.y]);
-        Vec3f e2(vertices[f_vids.z]);
-        e1 -= f_v0;
-        e2 -= f_v0;
-        Vec3f n = e1.cross(e2);
-        n.normalize();
-        float d = -(n.dot(f_v0));
-        v_qem.add_plane({ n.x, n.y, n.z, d });
+        float3 a=vertices[f_vids.x],b=vertices[f_vids.y],c=vertices[f_vids.z];
+        double ux=double(b.x)-a.x,uy=double(b.y)-a.y,uz=double(b.z)-a.z;
+        double vx=double(c.x)-a.x,vy=double(c.y)-a.y,vz=double(c.z)-a.z;
+        double nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+        double double_area=sqrt(nx*nx+ny*ny+nz*nz);
+        if (!(double_area>0.0)||!isfinite(double_area)) {v_qem.weight=NAN;break;}
+        nx/=double_area;ny/=double_area;nz/=double_area;
+        double d=-(nx*double(a.x)+ny*double(a.y)+nz*double(a.z));
+        // meshoptimizer b233043: sqrt(double-area) scales weight linearly.
+        v_qem.add_plane(make_double4(nx,ny,nz,d),sqrt(double_area));
     }
     qems[tid] = v_qem;
 }
@@ -95,11 +96,10 @@ inline __device__ bool process_incident_tri(
     int collapse_other_vert, // the other one (the one removed)
     const float3* vertices,
     const int3* faces,
-    const Vec3f& v_new, // midpoint
+    const Vec3f& v_new, // actual stored fp32 proposal
     float& skinny_cost,
     int& num_tri
 ) {
-    const float EPS = 1e-12f;
     int3 f_vids = faces[tri_idx];
 
     // If this triangle contains the other vertex (the edge), it will be removed, skip it
@@ -116,31 +116,19 @@ inline __device__ bool process_incident_tri(
     Vec3f nb = (f_vids.y == collapse_keep_vert) ? v_new : b;
     Vec3f nc = (f_vids.z == collapse_keep_vert) ? v_new : c;
 
-    // compute old edge vectors (for old normal)
-    Vec3f old_e1 = b - a;
-    Vec3f old_e2 = c - a;
-    Vec3f old_normal = old_e1.cross(old_e2);
-    float old_area = 0.5f * old_normal.norm();
-
-    // compute new edge vectors consistently: e1 = nb - na, e2 = nc - na
-    Vec3f new_e1 = nb - na;
-    Vec3f new_e2 = nc - na;
-    Vec3f new_normal = new_e1.cross(new_e2);
-    float new_area = 0.5f * new_normal.norm();
-
-    // Zero area is invalid too: accepting it produces NaN quadrics next round.
-    if (!(old_area > 0.0f) || !(new_area > 0.0f) ||
-        !isfinite(old_area) || !isfinite(new_area) ||
-        !(old_normal.dot(new_normal) > 0.0f)) {
-        return false;
-    }
-
-    // compute side lengths squared for shape metric
-    Vec3f new_e0 = nc - nb;
-    float denom = new_e0.norm2() + new_e1.norm2() + new_e2.norm2();
-    if (denom < EPS) denom = EPS;
-    float shapeMetric = 4.0f * sqrtf(3.0f) * new_area / denom;
-    float term = 1.0f - fminf(fmaxf(shapeMetric, 0.0f), 1.0f);
+    // Check actual stored fp32 positions, promoted to fp64 like the audit.
+    double ux=double(b.x)-a.x,uy=double(b.y)-a.y,uz=double(b.z)-a.z;
+    double vx=double(c.x)-a.x,vy=double(c.y)-a.y,vz=double(c.z)-a.z;
+    double ox=uy*vz-uz*vy,oy=uz*vx-ux*vz,oz=ux*vy-uy*vx;
+    double px=double(nb.x)-na.x,py=double(nb.y)-na.y,pz=double(nb.z)-na.z;
+    double qx=double(nc.x)-na.x,qy=double(nc.y)-na.y,qz=double(nc.z)-na.z;
+    double nx=py*qz-pz*qy,ny=pz*qx-px*qz,nz=px*qy-py*qx;
+    double old_area=.5*sqrt(ox*ox+oy*oy+oz*oz),new_area=.5*sqrt(nx*nx+ny*ny+nz*nz);
+    if (!(old_area>0.0)||!(new_area>0.0)||!isfinite(old_area)||!isfinite(new_area)||!(ox*nx+oy*ny+oz*nz>0.0)) return false;
+    double ex=double(nc.x)-nb.x,ey=double(nc.y)-nb.y,ez=double(nc.z)-nb.z;
+    double denom=ex*ex+ey*ey+ez*ez+px*px+py*py+pz*pz+qx*qx+qy*qy+qz*qz;
+    double metric=4.0*sqrt(3.0)*new_area/denom;
+    float term=float(1.0-fmin(fmax(metric,0.0),1.0));
     skinny_cost += term;
     num_tri += 1;
     return true;
@@ -326,7 +314,8 @@ static __global__ void get_edge_collapse_cost_kernel(
     const int E,
     const float lambda_edge_length,
     const float lambda_skinny,
-    float* edge_collapse_costs
+    float* edge_collapse_costs,
+    float3* proposed_positions, double max_error_squared
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E) return;
@@ -343,53 +332,42 @@ static __global__ void get_edge_collapse_cost_kernel(
         return;
     }
 
-    // get edge vertices
-    Vec3f v0(vertices[e0]);
-    Vec3f v1(vertices[e1]);
-    uint8_t v0_is_bound = vert_is_boundary[e0];
-    uint8_t v1_is_bound = vert_is_boundary[e1];
-    float w0 = 0.5;
-    if (v0_is_bound && !v1_is_bound) w0 = 1.0;
-    else if (!v0_is_bound &&  v1_is_bound) w0 = 0.0;
-    Vec3f v = v0 * w0 + v1 * (1.0f - w0);
-
-    float cost = 0.0f;
-
-    // QEM cost
-    QEM edge_qem = qems[e0] + qems[e1];
-    float qem_cost = edge_qem.evaluate(v);
-    cost += qem_cost;
-
-    // edge length cost
-    float edge_length2 = (v1 - v0).norm2();
-    cost += lambda_edge_length * edge_length2;
-
-    // skinny cost
-    float skinny_cost = 0.0f;
-    int num_tri = 0;
-    for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
-        int tri_idx = vert2face[f];
-        if (!process_incident_tri(tri_idx, e0, e1, vertices, faces, v, skinny_cost, num_tri)) {
-            edge_collapse_costs[tid] = INFINITY;
-            return;
-        }
+    float3 p0=vertices[e0],p1=vertices[e1];
+    QEM q=qems[e0]+qems[e1];
+    if (!(q.weight>0.0)||!isfinite(q.weight)) {edge_collapse_costs[tid]=INFINITY;return;}
+    float3 candidates[5];int count_candidates=0;
+    bool b0=vert_is_boundary[e0],b1=vert_is_boundary[e1];
+    if (b0!=b1) candidates[count_candidates++]=b0?p0:p1;
+    else {
+        float3 optimal;double error;
+        // Boundary edges stay on their segment; interior edges may use optimum.
+        if (!b0 && q.solve_optimal(optimal,error)) candidates[count_candidates++]=optimal;
+        candidates[count_candidates++]=q.solve_segment(p0,p1);
+        candidates[count_candidates++]=p0;candidates[count_candidates++]=p1;
+        candidates[count_candidates++]=make_float3(.5f*p0.x+.5f*p1.x,.5f*p0.y+.5f*p1.y,.5f*p0.z+.5f*p1.z);
     }
-    for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
-        int tri_idx = vert2face[f];
-        if (!process_incident_tri(tri_idx, e1, e0, vertices, faces, v, skinny_cost, num_tri)) {
-            edge_collapse_costs[tid] = INFINITY;
-            return;
-        }
+    double dx=double(p1.x)-p0.x,dy=double(p1.y)-p0.y,dz=double(p1.z)-p0.z;
+    double length2=dx*dx+dy*dy+dz*dz,best_error=INFINITY,best_cost=INFINITY;
+    float3 best=make_float3(0,0,0);
+    for (int k=0;k<count_candidates;++k) {
+        Vec3f v(candidates[k]);
+        if (!isfinite(v.x)||!isfinite(v.y)||!isfinite(v.z)) continue;
+        double error=q.normalized_error(v);
+        if (!isfinite(error)||error>max_error_squared) continue;
+        float skinny=0;int count=0;bool valid=true;
+        for (int f=vert2face_offset[e0];f<vert2face_offset[e0+1];++f)
+            if (!process_incident_tri(vert2face[f],e0,e1,vertices,faces,v,skinny,count)) {valid=false;break;}
+        if (!valid) continue;
+        for (int f=vert2face_offset[e1];f<vert2face_offset[e1+1];++f)
+            if (!process_incident_tri(vert2face[f],e1,e0,vertices,faces,v,skinny,count)) {valid=false;break;}
+        if (!valid) continue;
+        double cost=error+lambda_edge_length*length2;
+        if (count) cost+=lambda_skinny*(skinny/count)*length2;
+        if (isfinite(cost)&&(error<best_error||(error==best_error&&cost<best_cost))) {best_error=error;best_cost=cost;best=candidates[k];}
     }
-    if (num_tri > 0) {
-        skinny_cost /= num_tri;
-    }
-    cost += lambda_skinny * skinny_cost * edge_length2;
+    edge_collapse_costs[tid]=isfinite(best_cost)?float(best_cost):INFINITY;
+    proposed_positions[tid]=best;
 
-    // Packed atomic ordering is defined only for finite nonnegative costs.
-    // The exact QEM is nonnegative; float32 cancellation can make it slightly
-    // negative. Clamp to +0 instead of rejecting useful planar contractions.
-    edge_collapse_costs[tid] = isfinite(cost) ? fmaxf(cost, 0.0f) : INFINITY;
 }
 
 
@@ -400,7 +378,8 @@ void get_edge_collapse_cost(
     CuMesh& ctx,
     float lambda_edge_length,
     float lambda_skinny,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const QEM* quadrics,float3* proposed_positions,double max_error_squared
 ) {
     size_t V = ctx.vertices.size;
     size_t F = ctx.faces.size;
@@ -414,10 +393,10 @@ void get_edge_collapse_cost(
         ctx.edges.ptr,
         ctx.vert_is_boundary.ptr,
         ctx.vert_is_manifold.ptr,
-        reinterpret_cast<const QEM*>(ctx.temp_storage.ptr),
+        quadrics,
         V, F, E,
         lambda_edge_length, lambda_skinny,
-        ctx.edge_collapse_costs.ptr
+        ctx.edge_collapse_costs.ptr,proposed_positions,max_error_squared
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -679,24 +658,17 @@ static void select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStre
 static __global__ void collapse_edges_kernel(
     float3* vertices, int3* faces, const uint64_t* edges,
     const int* vert2face, const int* vert2face_offset,
-    const float* edge_collapse_costs, const uint8_t* vert_is_boundary,
-    int E, int* vertices_kept, int* faces_kept
+    const float* edge_collapse_costs,const float3* proposed_positions,
+    int E,int* vertices_kept,int* faces_kept,int* merge_partner
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E || !isfinite(edge_collapse_costs[tid])) return;
     uint64_t e = edges[tid];
     int e0 = int(e >> 32), e1 = int(e & 0xFFFFFFFF);
 
-    // collapse edge
-    Vec3f v0(vertices[e0]);
-    Vec3f v1(vertices[e1]);
-    uint8_t v0_is_bound = vert_is_boundary[e0];
-    uint8_t v1_is_bound = vert_is_boundary[e1];
-    float w0 = 0.5;
-    if (v0_is_bound && !v1_is_bound) w0 = 1.0;
-    else if (!v0_is_bound &&  v1_is_bound) w0 = 0.0;
-    Vec3f v_new = v0 * w0 + v1 * (1.0f - w0);
-    vertices[e0] = { v_new.x, v_new.y, v_new.z };
+    // Commit the same fp32 proposal that passed cost-time geometry predicates.
+    vertices[e0]=proposed_positions[tid];
+    if (merge_partner) merge_partner[e0]=e1;
     vertices_kept[e1] = 0;
     // delete shared faces
     for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
@@ -738,6 +710,17 @@ static __global__ void compress_vertices_kernel(
 }
 
 
+static __global__ void compress_quadrics_kernel(
+    const int* map,const int* partner,const QEM* previous,int V,QEM* next
+) {
+    int vertex=blockIdx.x*blockDim.x+threadIdx.x;
+    if (vertex>=V||map[vertex+1]!=map[vertex]+1) return;
+    QEM q=previous[vertex];
+    if (partner[vertex]>=0) q+=previous[partner[vertex]];
+    next[map[vertex]]=q;
+}
+
+
 static __global__ void compress_faces_kernel(
     const int* faces_map,
     const int* vertices_map,
@@ -764,7 +747,8 @@ void collapse_edges(
     CuMesh& ctx,
     float collapse_thresh,
     cudaStream_t stream,
-    bool timing
+    bool timing,const float3* proposed_positions,
+    const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,int* merge_partner
 ) {
     size_t V = ctx.vertices.size;
     size_t F = ctx.faces.size;
@@ -791,10 +775,10 @@ void collapse_edges(
         ctx.vert2face.ptr,
         ctx.vert2face_offset.ptr,
         ctx.edge_collapse_costs.ptr,
-        ctx.vert_is_boundary.ptr,
+        proposed_positions,
         E,
         ctx.vertices_map.ptr,
-        ctx.faces_map.ptr
+        ctx.faces_map.ptr,merge_partner
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -813,6 +797,13 @@ void collapse_edges(
     int new_num_vertices;
     CUDA_CHECK(cudaMemcpyAsync(&new_num_vertices, ctx.vertices_map.ptr + V, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (next_quadrics) {
+        *next_quadrics=torch::empty({int64_t(new_num_vertices),int64_t(12)},previous_quadrics->options());
+        compress_quadrics_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,stream>>>(
+            ctx.vertices_map.ptr,merge_partner,reinterpret_cast<const QEM*>(previous_quadrics->data_ptr<double>()),V,
+            reinterpret_cast<QEM*>(next_quadrics->data_ptr<double>()));
+        CUDA_CHECK(cudaGetLastError());
+    }
     // compress vertices
     ctx.temp_storage.resize(new_num_vertices * sizeof(float3));
     compress_vertices_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
@@ -852,13 +843,13 @@ void collapse_edges(
 }
 
 
-std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing) {
-    CuMeshOperationScope operation(*this);
-    cudaStream_t stream = current_stream();
+static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_length,float lambda_skinny,float threshold,bool timing,const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,double max_error_squared) {
+    CuMeshOperationScope operation(ctx);
+    cudaStream_t stream=operation.stream();
     std::chrono::high_resolution_clock::time_point start, end;
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    this->get_vertex_face_adjacency();
+    ctx.get_vertex_face_adjacency();
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -866,9 +857,9 @@ std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambd
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    this->get_edges();
-    this->get_boundary_info();
-    get_collapse_vertex_fans(*this, stream);
+    ctx.get_edges();
+    ctx.get_boundary_info();
+    get_collapse_vertex_fans(ctx, stream);
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -876,7 +867,15 @@ std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambd
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    get_qem(*this, stream);
+    const QEM* quadrics;
+    if (previous_quadrics) quadrics=reinterpret_cast<const QEM*>(previous_quadrics->data_ptr<double>());
+    else {get_qem(ctx,stream);quadrics=reinterpret_cast<const QEM*>(ctx.temp_storage.ptr);}
+    ScopedCudaTemporary<float3> proposals(ctx.edges.size,stream,operation.device_index());
+    ScopedCudaTemporary<int> partners(next_quadrics?ctx.vertices.size:0,stream,operation.device_index());
+    if (next_quadrics) {
+        fill_kernel<<<(ctx.vertices.size+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,stream>>>(partners.get(),ctx.vertices.size,-1);
+        CUDA_CHECK(cudaGetLastError());
+    }
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -884,7 +883,7 @@ std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambd
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    get_edge_collapse_cost(*this, lambda_edge_length, lambda_skinny, stream);
+    get_edge_collapse_cost(ctx,lambda_edge_length,lambda_skinny,stream,quadrics,proposals.get(),max_error_squared);
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -892,7 +891,7 @@ std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambd
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    propagate_cost(*this, stream);
+    propagate_cost(ctx, stream);
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -900,7 +899,7 @@ std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambd
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    collapse_edges(*this, threshold, stream, timing);
+    collapse_edges(ctx,threshold,stream,timing,proposals.get(),previous_quadrics,next_quadrics,partners.get());
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -908,9 +907,39 @@ std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambd
     }
 
     // Delete all cached info since mesh has changed
-    this->clear_cache();
+    ctx.clear_cache();
 
-    return std::make_tuple(this->vertices.size, this->faces.size);
+    return std::make_tuple(ctx.vertices.size, ctx.faces.size);
+}
+
+
+std::tuple<int,int> CuMesh::simplify_step(float edge,float skinny,float threshold,bool timing) {
+    return simplify_step_impl(*this,edge,skinny,threshold,timing,nullptr,nullptr,INFINITY);
+}
+
+// Call-owned Tensor state survives clear_cache without adding sticky native state.
+torch::Tensor CuMesh::initial_simplification_quadrics() {
+    CuMeshOperationScope operation(*this);
+    get_vertex_face_adjacency();
+    static_assert(sizeof(QEM)==12*sizeof(double),"quadric Tensor layout");
+    auto out=torch::empty({int64_t(vertices.size),int64_t(12)},torch::TensorOptions().dtype(torch::kFloat64).device(torch::Device(torch::kCUDA,operation.device_index())));
+    get_qem_kernel<<<(vertices.size+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,operation.stream()>>>(
+        vertices.ptr,faces.ptr,vert2face.ptr,vert2face_offset.ptr,vertices.size,faces.size,reinterpret_cast<QEM*>(out.data_ptr<double>()));
+    CUDA_CHECK(cudaGetLastError());
+    return out;
+}
+
+std::tuple<int,int,torch::Tensor> CuMesh::simplify_step_accumulated(
+    const torch::Tensor& quadrics,float edge,float skinny,float threshold,double max_error_squared,bool timing
+) {
+    CuMeshOperationScope operation(*this);
+    TORCH_CHECK(quadrics.is_cuda()&&quadrics.get_device()==operation.device_index(),"quadrics must share canonical CUDA device");
+    TORCH_CHECK(quadrics.scalar_type()==torch::kFloat64&&quadrics.is_contiguous(),"quadrics must be contiguous float64");
+    TORCH_CHECK(quadrics.dim()==2&&quadrics.size(0)==vertices.size&&quadrics.size(1)==12,"quadrics must match vertices and 12-double layout");
+    TORCH_CHECK(max_error_squared>=0.0&&!std::isnan(max_error_squared),"invalid quadric error bound");
+    torch::Tensor next;
+    auto counts=simplify_step_impl(*this,edge,skinny,threshold,timing,&quadrics,&next,max_error_squared);
+    return std::make_tuple(std::get<0>(counts),std::get<1>(counts),next);
 }
 
 

@@ -41,7 +41,9 @@ struct __align__(16) QEM
 {
     // store upper triangle of symmetric 4x4 matrix:
     // e = [ 00, 01, 02, 03, 11, 12, 13, 22, 23, 33 ]
-    float e[10];
+    double e[10];
+    double weight;
+    double padding; // initialize the 12-double, 16-byte-aligned Tensor row
 
     __device__ __forceinline__ QEM();
     __device__ __forceinline__ QEM operator+(const QEM& o) const;
@@ -49,9 +51,11 @@ struct __align__(16) QEM
     __device__ __forceinline__ QEM operator-(const QEM& o) const;
     __device__ __forceinline__ QEM& operator-=(const QEM& o);
     __device__ __forceinline__ void zero();
-    __device__ __forceinline__ void add_plane(float4 p);
-    __device__ __forceinline__ float evaluate(const Vec3f& p) const;
-    __device__ __forceinline__ bool solve_optimal(float3 &out, float &err) const;
+    __device__ __forceinline__ void add_plane(double4 p, double plane_weight);
+    __device__ __forceinline__ double evaluate(const Vec3f& p) const;
+    __device__ __forceinline__ bool solve_optimal(float3 &out, double &err) const;
+    __device__ __forceinline__ float3 solve_segment(float3 a, float3 b) const;
+    __device__ __forceinline__ double normalized_error(const Vec3f& p) const;
 };
 
 
@@ -178,6 +182,7 @@ __device__ __forceinline__ QEM QEM::operator+(const QEM& o) const {
     QEM res;
     #pragma unroll
     for (int i = 0; i < 10; ++i) res.e[i] = e[i] + o.e[i];
+    res.weight = weight + o.weight;
     return res;
 }
 
@@ -185,6 +190,7 @@ __device__ __forceinline__ QEM QEM::operator+(const QEM& o) const {
 __device__ __forceinline__ QEM& QEM::operator+=(const QEM& o) {
     #pragma unroll
     for (int i = 0; i < 10; ++i) e[i] += o.e[i];
+    weight += o.weight;
     return *this;
 }
 
@@ -193,6 +199,7 @@ __device__ __forceinline__ QEM QEM::operator-(const QEM& o) const {
     QEM res;
     #pragma unroll
     for (int i = 0; i < 10; ++i) res.e[i] = e[i] - o.e[i];
+    res.weight = weight - o.weight;
     return res;
 }
 
@@ -200,17 +207,19 @@ __device__ __forceinline__ QEM QEM::operator-(const QEM& o) const {
 __device__ __forceinline__ QEM& QEM::operator-=(const QEM& o) {
     #pragma unroll
     for (int i = 0; i < 10; ++i) e[i] -= o.e[i];
+    weight -= o.weight;
     return *this;
 }
 
 __device__ __forceinline__ void QEM::zero() {
     #pragma unroll
-    for (int i = 0; i < 10; ++i) e[i] = 0.0f;
+    for (int i = 0; i < 10; ++i) e[i] = 0.0;
+    weight = padding = 0.0;
 }
 
 
 // Add plane p = (a,b,c,d) as outer product p * p^T
-__device__ __forceinline__ void QEM::add_plane(float4 p) {
+__device__ __forceinline__ void QEM::add_plane(double4 p, double plane_weight) {
     // upper triangle indices mapping:
     // (0,0)->e[0]
     // (0,1)->e[1]
@@ -222,27 +231,28 @@ __device__ __forceinline__ void QEM::add_plane(float4 p) {
     // (2,2)->e[7]
     // (2,3)->e[8]
     // (3,3)->e[9]
-    float a = p.x, b = p.y, c = p.z, d = p.w;
-    e[0] += a * a;
-    e[1] += a * b;
-    e[2] += a * c;
-    e[3] += a * d;
-    e[4] += b * b;
-    e[5] += b * c;
-    e[6] += b * d;
-    e[7] += c * c;
-    e[8] += c * d;
-    e[9] += d * d;
+    double a = p.x, b = p.y, c = p.z, d = p.w;
+    weight += plane_weight;
+    e[0] += plane_weight * a * a;
+    e[1] += plane_weight * a * b;
+    e[2] += plane_weight * a * c;
+    e[3] += plane_weight * a * d;
+    e[4] += plane_weight * b * b;
+    e[5] += plane_weight * b * c;
+    e[6] += plane_weight * b * d;
+    e[7] += plane_weight * c * c;
+    e[8] += plane_weight * c * d;
+    e[9] += plane_weight * d * d;
 }
 
 
 // Evaluate v^T * Q * v for v = (x,y,z,1)
-__device__ __forceinline__ float QEM::evaluate(const Vec3f& p) const {
+__device__ __forceinline__ double QEM::evaluate(const Vec3f& p) const {
     // compute v = [x,y,z,1]
-    float x = p.x, y = p.y, z = p.z, w = 1.0f;
+    double x = p.x, y = p.y, z = p.z, w = 1.0;
     // expand symmetric multiplication using stored upper triangular
     // result = sum_{i<=j} M_ij * v_i * v_j * (1 if i==j else 2)
-    float res = 0.0f;
+    double res = 0.0;
     // (0,0)
     res += e[0] * x * x;
     // (0,1) and (1,0)
@@ -267,57 +277,35 @@ __device__ __forceinline__ float QEM::evaluate(const Vec3f& p) const {
 }
 
 
-// Try to solve for optimal point minimizing v^T Q v with constraint v = (x,y,z,1)
-// Solve the linear system: A * [x y z]^T = -b, where
-// A = top-left 3x3 of Q, b = [e03, e13, e23] (note signs)
-// Return true if solved (matrix invertible), false otherwise. err returns the error at the solution.
-__device__ __forceinline__ bool QEM::solve_optimal(float3 &out, float &err) const {
-    // Build A (symmetric)
-    float A00 = e[0];
-    float A01 = e[1];
-    float A02 = e[2];
-    float A11 = e[4];
-    float A12 = e[5];
-    float A22 = e[7];
-    // b = (e03, e13, e23) where e03=e[3], e13=e[6], e23=e[8]
-    float b0 = e[3];
-    float b1 = e[6];
-    float b2 = e[8];
+// Weighted error and relative LDL pivots follow meshoptimizer b233043,
+// src/simplifier.cpp quadricError/quadricSolve (MIT), without copying its CPU
+// implementation. Every proposal rounds to actual fp32 before its predicates.
+__device__ __forceinline__ double QEM::normalized_error(const Vec3f& p) const {
+    return weight > 0.0 && isfinite(weight) ? fabs(evaluate(p)) / weight : INFINITY;
+}
 
-    // Solve A * x = -b
-    // Use analytic inverse for 3x3 symmetric matrix (compute determinant)
-    // Compute determinant
-    float det =
-        A00 * (A11 * A22 - A12 * A12) -
-        A01 * (A01 * A22 - A12 * A02) +
-        A02 * (A01 * A12 - A11 * A02);
+__device__ __forceinline__ bool QEM::solve_optimal(float3& out, double& err) const {
+    const double relative_pivot_tolerance = 1e-6; // meshoptimizer b233043
+    double eps=relative_pivot_tolerance*weight, d0=e[0];
+    if (!(d0 > eps)) return false;
+    double l10=e[1]/d0,l20=e[2]/d0,d1=e[4]-e[1]*l10;
+    if (!(d1 > eps)) return false;
+    double t=e[5]-e[2]*l10,l21=t/d1,d2=e[7]-e[2]*l20-t*l21;
+    if (!(d2 > eps)) return false;
+    double y0=-e[3],y1=-e[6]-l10*y0,y2=-e[8]-l20*y0-l21*y1;
+    double z=y2/d2,y=y1/d1-l21*z,x=y0/d0-l10*y-l20*z;
+    out=make_float3(float(x),float(y),float(z));
+    err=normalized_error(Vec3f(out));
+    return isfinite(out.x)&&isfinite(out.y)&&isfinite(out.z)&&isfinite(err);
+}
 
-    if (fabsf(det) < 1e-12f) {
-        // singular - fall back: pick minimal among corners (or average 0)
-        // Here choose to put out as (0,0,0)
-        out = make_float3(0.0f, 0.0f, 0.0f);
-        err = evaluate(out);
-        return false;
-    }
-
-    float invDet = 1.0f / det;
-
-    // Compute inverse(A) via adjugate
-    float inv00 =  (A11 * A22 - A12 * A12) * invDet;
-    float inv01 = -(A01 * A22 - A12 * A02) * invDet;
-    float inv02 =  (A01 * A12 - A11 * A02) * invDet;
-    float inv11 =  (A00 * A22 - A02 * A02) * invDet;
-    float inv12 = -(A00 * A12 - A01 * A02) * invDet;
-    float inv22 =  (A00 * A11 - A01 * A01) * invDet;
-
-    // x = -inv(A) * b
-    float x = -(inv00 * b0 + inv01 * b1 + inv02 * b2);
-    float y = -(inv01 * b0 + inv11 * b1 + inv12 * b2);
-    float z = -(inv02 * b0 + inv12 * b1 + inv22 * b2);
-
-    out = make_float3(x, y, z);
-    err = evaluate(out);
-    return true;
+__device__ __forceinline__ float3 QEM::solve_segment(float3 a,float3 b) const {
+    double x=a.x,y=a.y,z=a.z,dx=double(b.x)-x,dy=double(b.y)-y,dz=double(b.z)-z;
+    double ax=e[0]*dx+e[1]*dy+e[2]*dz,ay=e[1]*dx+e[4]*dy+e[5]*dz,az=e[2]*dx+e[5]*dy+e[7]*dz;
+    double curvature=dx*ax+dy*ay+dz*az;
+    double gradient=dx*(e[0]*x+e[1]*y+e[2]*z+e[3])+dy*(e[1]*x+e[4]*y+e[5]*z+e[6])+dz*(e[2]*x+e[5]*y+e[7]*z+e[8]);
+    double t=curvature > 0.0 ? fmax(0.0,fmin(1.0,-gradient/curvature)) : 0.5;
+    return make_float3(float(x+t*dx),float(y+t*dy),float(z+t*dz));
 }
 
 
