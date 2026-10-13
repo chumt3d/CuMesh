@@ -8,7 +8,7 @@ from tqdm import tqdm
 from .xatlas import Atlas
 from . import _C
 
-SIMPLIFICATION_POLICY_VERSION = "cumesh.cumulative-error-first.v3"
+SIMPLIFICATION_POLICY_VERSION = "cumesh.cumulative-cover-error-first.v4"
 
 
 class SimplificationFailure(RuntimeError):
@@ -469,7 +469,9 @@ class CuMesh:
     def simplify(self, target_num_faces: int | None = None, verbose: bool=False, options: dict={}):
         """Accumulate original planes with optional error-first admission.
 
-        max_error is weighted RMS plane distance in vertex units, not Hausdorff.
+        max_error bounds the cumulative original-vertex cluster cover radius.
+        Weighted RMS original-plane distance ranks proposals; callers still
+        qualify the final actual surface samples.
         Target count is an extra stop. At an error/topology floor, the readable
         result may exceed the target; last_simplification reports that state.
         """
@@ -497,7 +499,7 @@ class CuMesh:
         if deadline is not None and not math.isfinite(deadline):
             raise ValueError("deadline_monotonic must be finite")
         faces=self.cu_mesh.num_faces()
-        self.last_simplification={"target_faces":target_num_faces,"max_error":error_limit,"metric":"weighted_RMS_original_face_planes","steps":[],"status":"running"}
+        self.last_simplification={"target_faces":target_num_faces,"max_error":error_limit,"metric":"outward_rounded_original_vertex_cluster_cover","ranking_metric":"weighted_RMS_original_face_planes","steps":[],"status":"running"}
         if target_num_faces is not None and faces<=target_num_faces:
             self.last_simplification.update(status="target_reached",remaining_faces=faces)
             return

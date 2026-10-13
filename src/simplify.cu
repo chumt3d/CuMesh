@@ -302,6 +302,22 @@ void get_collapse_vertex_fans(CuMesh& ctx, cudaStream_t stream) {
  * @param E: the number of edges
  * @param edge_collapse_costs: the buffer for edge collapse costs, shape (E)
  */
+// Outward-rounded cluster cover bounds actual original-vertex displacement.
+// A legal contraction maps every original simplex to a surviving simplex.
+// Barycentric interpolation then bounds both surface directions by this radius.
+__device__ inline double displacement_upper(float3 a,float3 b) {
+    double dx=__dsub_ru(fmax(double(a.x),double(b.x)),fmin(double(a.x),double(b.x)));
+    double dy=__dsub_ru(fmax(double(a.y),double(b.y)),fmin(double(a.y),double(b.y)));
+    double dz=__dsub_ru(fmax(double(a.z),double(b.z)),fmin(double(a.z),double(b.z)));
+    return __dsqrt_ru(__dadd_ru(__dmul_ru(dx,dx),__dadd_ru(__dmul_ru(dy,dy),__dmul_ru(dz,dz))));
+}
+
+__device__ inline double cluster_cover_upper(const QEM& a,const QEM& b,float3 pa,float3 pb,float3 proposed) {
+    return fmax(__dadd_ru(a.radius,displacement_upper(pa,proposed)),
+                __dadd_ru(b.radius,displacement_upper(pb,proposed)));
+}
+
+
 static __global__ void get_edge_collapse_cost_kernel(
     const float3* vertices,
     const int3* faces,
@@ -336,7 +352,7 @@ static __global__ void get_edge_collapse_cost_kernel(
 
     float3 p0=vertices[e0],p1=vertices[e1];
     QEM q=qems[e0]+qems[e1];
-    if (!(q.weight>0.0)||!isfinite(q.weight)) {edge_collapse_costs[tid]=INFINITY;return;}
+    if (!(q.weight>0.0)||!isfinite(q.weight)||!(qems[e0].radius>=0.0)||!(qems[e1].radius>=0.0)) {edge_collapse_costs[tid]=INFINITY;return;}
     float3 candidates[5];int count_candidates=0;
     bool b0=vert_is_boundary[e0],b1=vert_is_boundary[e1];
     if (b0!=b1) candidates[count_candidates++]=b0?p0:p1;
@@ -356,6 +372,8 @@ static __global__ void get_edge_collapse_cost_kernel(
         if (!isfinite(v.x)||!isfinite(v.y)||!isfinite(v.z)) continue;
         double error=q.normalized_error(v);
         if (!isfinite(error)||error>max_error_squared) continue;
+        double radius=cluster_cover_upper(qems[e0],qems[e1],p0,p1,candidates[k]);
+        if (!isfinite(radius)||__dmul_ru(radius,radius)>max_error_squared) continue;
         float skinny=0;int count=0;bool valid=true;
         for (int f=vert2face_offset[e0];f<vert2face_offset[e0+1];++f)
             if (!process_incident_tri(vert2face[f],e0,e1,vertices,faces,v,skinny,count)) {valid=false;break;}
@@ -667,7 +685,8 @@ static __global__ void collapse_edges_kernel(
     float3* vertices, int3* faces, const uint64_t* edges,
     const int* vert2face, const int* vert2face_offset,
     const float* edge_collapse_costs,const float3* proposed_positions,
-    int E,int* vertices_kept,int* faces_kept,int* merge_partner
+    int E,int* vertices_kept,int* faces_kept,int* merge_partner,
+    const QEM* previous_quadrics,double* merge_radius
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E || !isfinite(edge_collapse_costs[tid])) return;
@@ -675,8 +694,11 @@ static __global__ void collapse_edges_kernel(
     int e0 = int(e >> 32), e1 = int(e & 0xFFFFFFFF);
 
     // Commit the same fp32 proposal that passed cost-time geometry predicates.
+    if (merge_partner) {
+        merge_partner[e0]=e1;
+        merge_radius[e0]=cluster_cover_upper(previous_quadrics[e0],previous_quadrics[e1],vertices[e0],vertices[e1],proposed_positions[tid]);
+    }
     vertices[e0]=proposed_positions[tid];
-    if (merge_partner) merge_partner[e0]=e1;
     vertices_kept[e1] = 0;
     // delete shared faces
     for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
@@ -719,12 +741,12 @@ static __global__ void compress_vertices_kernel(
 
 
 static __global__ void compress_quadrics_kernel(
-    const int* map,const int* partner,const QEM* previous,int V,QEM* next
+    const int* map,const int* partner,const double* merge_radius,const QEM* previous,int V,QEM* next
 ) {
     int vertex=blockIdx.x*blockDim.x+threadIdx.x;
     if (vertex>=V||map[vertex+1]!=map[vertex]+1) return;
     QEM q=previous[vertex];
-    if (partner[vertex]>=0) q+=previous[partner[vertex]];
+    if (partner[vertex]>=0) {q+=previous[partner[vertex]];q.radius=merge_radius[vertex];}
     next[map[vertex]]=q;
 }
 
@@ -766,7 +788,7 @@ void collapse_edges(
     float collapse_thresh,
     cudaStream_t stream,
     bool timing,const float3* proposed_positions,
-    const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,int* merge_partner,
+    const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,int* merge_partner,double* merge_radius,
     const c10::cuda::CUDAStream& output_stream,const c10::cuda::CUDAStream& execution_stream
 ) {
     size_t V = ctx.vertices.size;
@@ -800,7 +822,7 @@ void collapse_edges(
         proposed_positions,
         E,
         ctx.vertices_map.ptr,
-        ctx.faces_map.ptr,merge_partner
+        ctx.faces_map.ptr,merge_partner,previous_quadrics?reinterpret_cast<const QEM*>(previous_quadrics->data_ptr<double>()):nullptr,merge_radius
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -822,7 +844,7 @@ void collapse_edges(
     if (next_quadrics) {
         TORCH_CHECK(next_quadrics->size(0)==new_num_vertices,"[CuMesh] accumulated quadric vertex count mismatch");
         compress_quadrics_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,stream>>>(
-            ctx.vertices_map.ptr,merge_partner,reinterpret_cast<const QEM*>(previous_quadrics->data_ptr<double>()),V,
+            ctx.vertices_map.ptr,merge_partner,merge_radius,reinterpret_cast<const QEM*>(previous_quadrics->data_ptr<double>()),V,
             reinterpret_cast<QEM*>(next_quadrics->data_ptr<double>()));
         CUDA_CHECK(cudaGetLastError());
     }
@@ -894,6 +916,7 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
     else {get_qem(ctx,stream);quadrics=reinterpret_cast<const QEM*>(ctx.temp_storage.ptr);}
     ScopedCudaTemporary<float3> proposals(ctx.edges.size,stream,operation.device_index());
     ScopedCudaTemporary<int> partners(next_quadrics?ctx.vertices.size:0,stream,operation.device_index());
+    ScopedCudaTemporary<double> radii(next_quadrics?ctx.vertices.size:0,stream,operation.device_index());
     if (next_quadrics) {
         fill_kernel<<<(ctx.vertices.size+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,stream>>>(partners.get(),ctx.vertices.size,-1);
         CUDA_CHECK(cudaGetLastError());
@@ -921,7 +944,7 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    collapse_edges(ctx,threshold,stream,timing,proposals.get(),previous_quadrics,next_quadrics,partners.get(),output_stream?*output_stream:operation.caller_stream(),operation.execution_stream());
+    collapse_edges(ctx,threshold,stream,timing,proposals.get(),previous_quadrics,next_quadrics,partners.get(),radii.get(),output_stream?*output_stream:operation.caller_stream(),operation.execution_stream());
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();

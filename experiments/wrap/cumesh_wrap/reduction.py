@@ -16,7 +16,7 @@ from .deviation import measure_bidirectional_deviation
 from .engine import WrapFailure, _component_labels
 from .warp_bvh import validate_mesh
 
-REDUCTION_POLICY_VERSION = "tiny3d.wrap.sampled-error-first.v3"
+REDUCTION_POLICY_VERSION = "tiny3d.wrap.sampled-cover-error-first.v4"
 
 
 @dataclass(frozen=True)
@@ -135,7 +135,7 @@ def reduce_surface(
         "source_tolerance_mm": source_tolerance_mm,
         "sample_deviation_budget_mm": budget,
         "deviation_fraction": settings.deviation_fraction,
-        "native_error_metric": "weighted_RMS_original_face_planes_mm",
+        "native_error_metric": "outward_rounded_original_vertex_cluster_cover_mm",
         "native_metric_is_sample_certificate": False,
         "requested_approximate_target_faces": target,
         "raw_vertices": len(raw_vertices),

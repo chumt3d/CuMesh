@@ -43,7 +43,7 @@ struct __align__(16) QEM
     // e = [ 00, 01, 02, 03, 11, 12, 13, 22, 23, 33 ]
     double e[10];
     double weight;
-    double padding; // initialize the 12-double, 16-byte-aligned Tensor row
+    double radius; // outward bound covering every original cluster vertex
 
     __device__ __forceinline__ QEM();
     __device__ __forceinline__ QEM operator+(const QEM& o) const;
@@ -214,7 +214,7 @@ __device__ __forceinline__ QEM& QEM::operator-=(const QEM& o) {
 __device__ __forceinline__ void QEM::zero() {
     #pragma unroll
     for (int i = 0; i < 10; ++i) e[i] = 0.0;
-    weight = padding = 0.0;
+    weight = radius = 0.0;
 }
 
 
