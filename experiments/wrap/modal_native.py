@@ -10,7 +10,9 @@ SOURCE_ROOT = HERE.parent.parent
 app = modal.App("tiny3d-s4-wrap-native-fix-v1")
 volume = modal.Volume.from_name("mesh-probe-artifacts", environment_name="dev")
 IMAGE_REF = "docker.io/adibuer/tiny3d:tiny3d-trellis-generation-image-s4rp-0724520a@sha256:d016fe0c9fc30dac0107f11c8c417187e8a075800ab74de9c36edb2ac8a797fe"
-image = modal.Image.from_registry(IMAGE_REF).env(
+image = modal.Image.from_registry(
+    IMAGE_REF, secret=modal.Secret.from_name("dockerhub-creds")
+).env(
     {
         **{
             key: "2"
