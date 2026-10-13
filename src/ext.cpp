@@ -96,6 +96,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("repair_non_manifold_edges", &cumesh::CuMesh::repair_non_manifold_edges)
         .def("remove_non_manifold_faces", &cumesh::CuMesh::remove_non_manifold_faces)
         .def("remove_small_connected_components", &cumesh::CuMesh::remove_small_connected_components)
+        .def("remove_small_geometric_connected_components", &cumesh::CuMesh::remove_small_geometric_connected_components)
         .def("unify_face_orientations", &cumesh::CuMesh::unify_face_orientations)
         .def("simplify_step", &cumesh::CuMesh::simplify_step)
         .def("compute_charts", &cumesh::CuMesh::compute_charts)

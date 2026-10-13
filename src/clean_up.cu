@@ -157,6 +157,11 @@ void CuMesh::remove_unreferenced_vertices() {
     cudaStream_t stream = current_stream();
     size_t V = this->vertices.size;
     size_t F = this->faces.size;
+    if (F == 0) {
+        this->vertices.resize(0);
+        this->clear_cache();
+        return;
+    }
 
     // Mark referenced vertices
     ScopedCudaTemporary<int> vertex_is_referenced_storage(V + 1, stream, operation.device_index());
@@ -971,9 +976,24 @@ struct GreaterThanOrEqualToOp {
 };
 
 
+void CuMesh::remove_small_geometric_connected_components(float min_area, torch::Tensor vertex_ids) {
+    CuMeshOperationScope operation(*this);
+    if (this->faces.size == 0) return;
+    try {
+        this->get_geometric_connected_components(vertex_ids);
+        this->remove_small_connected_components(min_area);
+    } catch (...) {
+        // Alternate component labels must never become a generic-mode cache.
+        this->clear_cache();
+        throw;
+    }
+}
+
+
 void CuMesh::remove_small_connected_components(float min_area) {
     CuMeshOperationScope operation(*this);
     cudaStream_t stream = current_stream();
+    if (this->faces.size == 0) return;
     if (this->conn_comp_ids.is_empty()) {
         this->get_connected_components();
     }

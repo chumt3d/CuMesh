@@ -38,7 +38,7 @@ See the [examples](examples) directory for more detailed usage.
 *   **`repair_non_manifold_edges()`**: Split edges to resolve non-manifold geometry.
 *   **`remove_degenerate_faces()`**: Remove zero-area faces or those with NaN normals.
 *   **`remove_duplicate_faces()`**: Remove faces with identical vertex indices.
-*   **`remove_small_connected_components(min_area)`**: Delete isolated components below area threshold.
+*   **`remove_small_connected_components(min_area, connectivity="manifold")`**: Delete components below area threshold. The default follows degree-two index edges. `connectivity="geometric_edge"` follows all shared exact numeric position edges, retaining attached non-manifold fan fragments without welding or moving surviving vertices. Point contacts do not join components.
 *   **`unify_face_orientations()`**: Reorient faces to have consistent winding order.
 *   **`compute_face_normals()`**, **`compute_vertex_normals()`**: Trigger normal calculation (access via `read_*_normals`).
 *   **`get_connected_components()`**: Compute connectivity (access via `read_connected_components`).

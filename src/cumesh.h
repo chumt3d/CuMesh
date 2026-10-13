@@ -480,6 +480,7 @@ public:
      * - conn_comp_ids
      */
     void get_connected_components();
+    void get_geometric_connected_components(torch::Tensor vertex_ids);
 
     /**
      * Get the boundary connected components of the mesh.
@@ -578,6 +579,7 @@ public:
      * @param min_area The minimum area of the connected components to be kept.
      */
     void remove_small_connected_components(float min_area);
+    void remove_small_geometric_connected_components(float min_area, torch::Tensor vertex_ids);
 
     /**
      * Unify face orientations.

@@ -438,14 +438,34 @@ class CuMesh:
         """
         self.cu_mesh.remove_non_manifold_faces()
         
-    def remove_small_connected_components(self, min_area: float):
+    def remove_small_connected_components(self, min_area: float, *, connectivity: str = "manifold"):
         """
-        Repair Non-manifold edges by splitting edges
-        
+        Remove face components whose total area is below min_area.
+
         Args:
             min_area: the minimum area of a connected component to keep.
+            connectivity: "manifold" connects degree-two index edges (default).
+                "geometric_edge" connects all exact-position edges, including
+                non-manifold fans, without welding or moving output positions.
         """
-        self.cu_mesh.remove_small_connected_components(min_area)
+        if connectivity == "manifold":
+            self.cu_mesh.remove_small_connected_components(min_area)
+        elif connectivity == "geometric_edge":
+            if not math.isfinite(min_area) or min_area < 0:
+                raise ValueError("min_area must be finite and nonnegative")
+            if self.num_faces == 0:
+                return
+            vertices, faces = self.read()
+            del faces
+            if not bool(torch.isfinite(vertices).all()):
+                raise ValueError("geometric component cleanup requires finite positions")
+            # Exact numeric position aliases only; never weld or move output vertices.
+            unique_positions, vertex_ids = torch.unique(vertices, dim=0, return_inverse=True)
+            del unique_positions, vertices
+            vertex_ids = vertex_ids.to(dtype=torch.int32).contiguous()
+            self.cu_mesh.remove_small_geometric_connected_components(min_area, vertex_ids)
+        else:
+            raise ValueError(f"unsupported component connectivity: {connectivity!r}")
         
     def unify_face_orientations(self):
         """

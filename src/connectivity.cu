@@ -3,6 +3,7 @@
 
 #include <c10/cuda/CUDAStream.h>
 #include <cub/cub.cuh>
+#include <climits>
 
 
 namespace cumesh {
@@ -838,6 +839,95 @@ void CuMesh::get_manifold_boundary_adjacency() {
     manifold_vert_idx_storage.reset();
 }
 
+
+
+// Group faces by every shared exact-position edge. Sorted edge occurrences form
+// a chain of k-1 links per fan, including degree > 2, without all-pairs expansion.
+static __global__ void geometric_face_edges_kernel(
+    const int3* faces, const int F, const int* vertex_ids,
+    uint64_t* edges, int* face_ids
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= F) return;
+    const int3 face = faces[tid];
+    const int v[3] = {vertex_ids[face.x], vertex_ids[face.y], vertex_ids[face.z]};
+    for (int corner = 0; corner < 3; ++corner) {
+        const unsigned int a = v[corner];
+        const unsigned int b = v[(corner + 1) % 3];
+        edges[3 * tid + corner] = (uint64_t(min(a, b)) << 32) | max(a, b);
+        face_ids[3 * tid + corner] = tid;
+    }
+}
+
+static __global__ void hook_geometric_face_edges_kernel(
+    const uint64_t* edges, const int* face_ids, const int count,
+    int* component_ids, int* end_flag
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid == 0 || tid >= count || edges[tid] != edges[tid - 1]) return;
+    // A collapsed edge is a point contact, not shared surface connectivity.
+    if (unsigned(edges[tid] >> 32) == unsigned(edges[tid])) return;
+    int root0 = component_ids[face_ids[tid - 1]];
+    while (root0 != component_ids[root0]) root0 = component_ids[root0];
+    int root1 = component_ids[face_ids[tid]];
+    while (root1 != component_ids[root1]) root1 = component_ids[root1];
+    if (root0 == root1) return;
+    atomicMin(&component_ids[max(root0, root1)], min(root0, root1));
+    *end_flag = 0;
+}
+
+void CuMesh::get_geometric_connected_components(torch::Tensor vertex_ids) {
+    CuMeshOperationScope operation(*this);
+    cudaStream_t stream = current_stream();
+    TORCH_CHECK(vertex_ids.is_cuda() && vertex_ids.get_device() == operation.device_index(),
+        "geometric vertex IDs must be on the mesh CUDA device");
+    TORCH_CHECK(vertex_ids.scalar_type() == torch::kInt32 && vertex_ids.is_contiguous(),
+        "geometric vertex IDs must be contiguous int32");
+    TORCH_CHECK(vertex_ids.dim() == 1 && vertex_ids.size(0) == this->vertices.size,
+        "geometric vertex IDs must have one entry per vertex");
+    const size_t F = this->faces.size;
+    TORCH_CHECK(F <= size_t((INT_MAX - BLOCK_SIZE) / 3), "geometric edge occurrence count exceeds int32 capacity");
+    this->conn_comp_ids.resize(F);
+    if (F == 0) { this->num_conn_comps = 0; return; }
+    TORCH_CHECK(vertex_ids.min().item<int>() >= 0 && vertex_ids.max().item<int>() < this->vertices.size,
+        "geometric vertex IDs must be in [0, num_vertices)");
+    const int count = int(3 * F);
+    ScopedCudaTemporary<uint64_t> keys(count, stream, operation.device_index());
+    ScopedCudaTemporary<uint64_t> sorted_keys(count, stream, operation.device_index());
+    ScopedCudaTemporary<int> face_ids(count, stream, operation.device_index());
+    ScopedCudaTemporary<int> sorted_face_ids(count, stream, operation.device_index());
+    geometric_face_edges_kernel<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        this->faces.ptr, int(F), vertex_ids.data_ptr<int>(), keys.get(), face_ids.get());
+    CUDA_CHECK(cudaGetLastError());
+    size_t bytes = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(nullptr, bytes,
+        keys.get(), sorted_keys.get(), face_ids.get(), sorted_face_ids.get(), count, 0, 64, stream));
+    this->cub_temp_storage.resize(bytes);
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(this->cub_temp_storage.ptr, bytes,
+        keys.get(), sorted_keys.get(), face_ids.get(), sorted_face_ids.get(), count, 0, 64, stream));
+    keys.reset();
+    face_ids.reset();
+    arange_kernel<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(this->conn_comp_ids.ptr, int(F));
+    CUDA_CHECK(cudaGetLastError());
+    ScopedCudaTemporary<int> end_flag(1, stream, operation.device_index());
+    int complete;
+    do {
+        complete = 1;
+        CUDA_CHECK(cudaMemcpyAsync(end_flag.get(), &complete, sizeof(int), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        hook_geometric_face_edges_kernel<<<(count + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            sorted_keys.get(), sorted_face_ids.get(), count, this->conn_comp_ids.ptr, end_flag.get());
+        CUDA_CHECK(cudaGetLastError());
+        compress_components_kernel<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            this->conn_comp_ids.ptr, int(F));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(&complete, end_flag.get(), sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } while (!complete);
+    sorted_keys.reset();
+    sorted_face_ids.reset();
+    this->num_conn_comps = compress_ids(this->conn_comp_ids.ptr, int(F), this->cub_temp_storage);
+}
 
 void CuMesh::get_connected_components() {
     CuMeshOperationScope operation(*this);
