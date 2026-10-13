@@ -8,13 +8,13 @@ from tqdm import tqdm
 from .xatlas import Atlas
 from . import _C
 
-SIMPLIFICATION_POLICY_VERSION = "cumesh.simplicial-link-and-single-fan.v2"
+SIMPLIFICATION_POLICY_VERSION = "cumesh.cumulative-error-first.v3"
 
 
 class SimplificationFailure(RuntimeError):
     """Target/deadline not reached; the current mesh remains owned and readable."""
 
-    def __init__(self, code: str, target_faces: int, remaining_faces: int):
+    def __init__(self, code: str, target_faces: int | None, remaining_faces: int):
         self.code = code
         self.target_faces = target_faces
         self.remaining_faces = remaining_faces
@@ -466,82 +466,79 @@ class CuMesh:
         """
         self.cu_mesh.unify_face_orientations()
     
-    def simplify(self, target_num_faces: int, verbose: bool=False, options: dict={}):
+    def simplify(self, target_num_faces: int | None = None, verbose: bool=False, options: dict={}):
+        """Accumulate original planes with optional error-first admission.
+
+        max_error is weighted RMS plane distance in vertex units, not Hausdorff.
+        Target count is an extra stop. At an error/topology floor, the readable
+        result may exceed the target; last_simplification reports that state.
         """
-        Simplifies the mesh using a fast approximation algorithm with gpu acceleration.
-
-        Args:
-            target_num_faces: the target number of faces to simplify to.
-            verbose: whether to print the progress of the simplification.
-            options: algorithm options; optional deadline_monotonic bounds the
-                operation between native steps.
-
-        Raises:
-            SimplificationFailure: deadline or no legal progress before target.
-                The current mesh remains readable through read().
-        """
-        assert isinstance(target_num_faces, int) and target_num_faces > 0, "target_num_faces must be a positive integer"
-
-        num_face = self.cu_mesh.num_faces()
-        if num_face <= target_num_faces:
-            return
-        
-        if verbose:
-            pbar = tqdm(total=num_face-target_num_faces, desc="Simplifying", disable=not verbose)
-
-        thresh = options.get('thresh', 1e-8)
-        lambda_edge_length = options.get('lambda_edge_length', 1e-2)
-        lambda_skinny = options.get('lambda_skinny', 1e-3)
-        deadline = options.get('deadline_monotonic')
+        error_limit=options.get('max_error')
+        if target_num_faces is not None and (not isinstance(target_num_faces,int) or target_num_faces<=0):
+            raise ValueError("target_num_faces must be a positive integer or None")
+        if target_num_faces is None and error_limit is None:
+            raise ValueError("max_error or target_num_faces is required")
+        maximum=torch.finfo(torch.float32).max
+        if error_limit is not None:
+            if not math.isfinite(error_limit) or error_limit<=0 or error_limit>math.sqrt(maximum):
+                raise ValueError("max_error must be positive finite with a float32-representable square")
+            max_error_squared=error_limit**2
+            threshold=max_error_squared
+        else:
+            max_error_squared=math.inf
+            threshold=options.get('thresh',1e-8)
+            if not math.isfinite(threshold) or not 0<=threshold<=maximum:
+                raise ValueError("thresh must be finite, nonnegative and representable as float32")
+        for name,default in [('lambda_edge_length',1e-2),('lambda_skinny',1e-3)]:
+            value=options.get(name,default)
+            if not math.isfinite(value) or not 0<=value<=maximum:
+                raise ValueError(f'{name} must be finite, nonnegative and representable as float32')
+        deadline=options.get('deadline_monotonic')
         if deadline is not None and not math.isfinite(deadline):
             raise ValueError("deadline_monotonic must be finite")
-        maximum_threshold = torch.finfo(torch.float32).max
-        if not math.isfinite(thresh) or not 0 <= thresh <= maximum_threshold:
-            raise ValueError("thresh must be finite, nonnegative and representable as float32")
-        self.last_simplification = {"target_faces": target_num_faces, "steps": [], "status": "running"}
+        faces=self.cu_mesh.num_faces()
+        self.last_simplification={"target_faces":target_num_faces,"max_error":error_limit,"metric":"weighted_RMS_original_face_planes","steps":[],"status":"running"}
+        if target_num_faces is not None and faces<=target_num_faces:
+            self.last_simplification.update(status="target_reached",remaining_faces=faces)
+            return
+        quadrics=None
+        pbar=tqdm(total=faces,desc="Simplifying",disable=not verbose)
         try:
+            quadrics=self.cu_mesh.initial_simplification_quadrics()
             while True:
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise SimplificationFailure("simplify_deadline", target_num_faces, num_face)
-                if verbose:
-                    pbar.set_description(f"Simplifying [thres={thresh:.2e}]")
-                step_started = time.monotonic()
-                new_num_vert, new_num_face = self.cu_mesh.simplify_step(lambda_edge_length, lambda_skinny, thresh, options.get('timing', False))
-                self.last_simplification["steps"].append({
-                    "faces_before": num_face, "faces_after": new_num_face,
-                    "threshold": thresh, "seconds": time.monotonic() - step_started,
-                })
-                if verbose:
-                    pbar.update(num_face - max(target_num_faces, new_num_face))
-                if new_num_face <= target_num_faces:
-                    self.last_simplification.update(status="target_reached", remaining_faces=new_num_face)
+                if deadline is not None and time.monotonic()>=deadline:
+                    raise SimplificationFailure("simplify_deadline",target_num_faces,faces)
+                started=time.monotonic()
+                _,next_faces,next_quadrics=self.cu_mesh.simplify_step_accumulated(
+                    quadrics,options.get('lambda_edge_length',1e-2),options.get('lambda_skinny',1e-3),
+                    threshold,max_error_squared,options.get('timing',False))
+                quadrics=next_quadrics
+                self.last_simplification['steps'].append({"faces_before":faces,"faces_after":next_faces,"threshold":threshold,"seconds":time.monotonic()-started})
+                pbar.update(faces-next_faces)
+                if target_num_faces is not None and next_faces<=target_num_faces:
+                    self.last_simplification.update(status="target_reached",remaining_faces=next_faces)
                     break
-                deleted = num_face - new_num_face
-                if deleted == 0 and thresh == maximum_threshold:
-                    # Every finite float32 cost was eligible in this step. No
-                    # legal contraction remains; infinity must never force one.
-                    raise SimplificationFailure("simplify_no_legal_progress", target_num_faces, new_num_face)
-                if deleted / num_face < 1e-2:
-                    # Preserve upstream threshold escalation without overflow.
-                    # A zero user threshold also advances to the format minimum.
-                    thresh = min(maximum_threshold, max(thresh * 10, torch.finfo(torch.float32).tiny))
-                num_face = new_num_face
+                deleted=faces-next_faces
+                if deleted==0 and error_limit is not None:
+                    self.last_simplification.update(status="error_or_topology_limit_reached",remaining_faces=next_faces)
+                    break
+                if deleted==0 and threshold==maximum:
+                    raise SimplificationFailure("simplify_no_legal_progress",target_num_faces,next_faces)
+                if error_limit is None and deleted/faces<1e-2:
+                    threshold=min(maximum,max(threshold*10,torch.finfo(torch.float32).tiny))
+                faces=next_faces
         except SimplificationFailure as error:
-            self.last_simplification.update(status=error.code, remaining_faces=error.remaining_faces)
+            self.last_simplification.update(status=error.code,remaining_faces=error.remaining_faces)
             raise
         except Exception:
-            self.last_simplification["status"] = "failed"
-            try:
-                self.last_simplification["remaining_faces"] = self.cu_mesh.num_faces()
-            except Exception:
-                # Preserve the original CUDA/backend error when the count query
-                # is unavailable; never replace it with a secondary failure.
-                self.last_simplification["remaining_faces"] = None
+            self.last_simplification['status']='failed'
+            try: self.last_simplification['remaining_faces']=self.cu_mesh.num_faces()
+            except Exception: self.last_simplification['remaining_faces']=None
             raise
         finally:
-            if verbose:
-                pbar.close()
-            
+            del quadrics
+            pbar.close()
+
     def compute_charts(
         self,
         threshold_cone_half_angle_rad: float=math.radians(90),
