@@ -104,6 +104,14 @@ Torch allocation peaks alone omit native allocations.
 
 ## Root CuMesh collapse correction (controller371)
 
+Policy v2 builds a deterministic maximal batch over one immutable cost/CSR
+snapshot. Each selection pass retains packed `(cost, edge ID)` priority, reserves
+chosen complete stars, removes conflicting candidates, then repeats on the
+remaining candidates. Geometry commits begin only after all selection passes.
+Endpoint-minimum/gather propagation computes the same full-star minima with two
+atomics per edge. One/two-face adjacency segments use an exact compare/swap;
+nonmanifold segments retain the full deterministic CUB sort.
+
 The initial three closed WRAP candidates became nonmanifold under both permitted
 QEM attempts. `src/simplify.cu` now checks the full simplicial link: shared
 neighbors must be the edge's one boundary or two interior opposites, and a common

@@ -438,6 +438,7 @@ void get_edge_collapse_cost(
 static __global__ void endpoint_min_cost_kernel(
     const uint64_t* edges,
     const float* edge_collapse_costs,
+    const uint8_t* active_edges,
     const int E,
     uint64_t* endpoint_min_costs
 ) {
@@ -449,7 +450,7 @@ static __global__ void endpoint_min_cost_kernel(
     int e0 = int(e >> 32);
     int e1 = int(e & 0xFFFFFFFF);
 
-    if (!isfinite(edge_collapse_costs[tid])) return;
+    if (!isfinite(edge_collapse_costs[tid]) || (active_edges && !active_edges[tid])) return;
     uint64_t cost = pack_key_value_positive(tid, edge_collapse_costs[tid]);
 
     atomicMin(reinterpret_cast<unsigned long long*>(&endpoint_min_costs[e0]), static_cast<unsigned long long>(cost));
@@ -485,7 +486,8 @@ static __global__ void gather_star_min_cost_kernel(
  */
 void propagate_cost(
     CuMesh& ctx,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const uint8_t* active_edges = nullptr
 ) {
     size_t V = ctx.vertices.size;
     size_t E = ctx.edges.size;
@@ -503,6 +505,7 @@ void propagate_cost(
     endpoint_min_cost_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.edges.ptr,
         ctx.edge_collapse_costs.ptr,
+        active_edges,
         E, endpoint_min_costs
     );
     CUDA_CHECK(cudaGetLastError());
@@ -538,19 +541,19 @@ static __global__ void select_collapse_edges_kernel(
     const uint64_t* edges,
     const int* vert2face,
     const int* vert2face_offset,
-    float* edge_collapse_costs,
+    const float* edge_collapse_costs,
     const uint64_t* propagated_costs,
-    const int E,
-    const float collapse_thresh
+    uint8_t* active_edges,
+    uint8_t* chosen_edges,
+    uint8_t* reserved_vertices,
+    int* progress,
+    const int E
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E) return;
 
     float cost = edge_collapse_costs[tid];
-    if (!isfinite(cost) || !(cost <= collapse_thresh)) {
-        edge_collapse_costs[tid] = INFINITY;
-        return;
-    }
+    if (!active_edges[tid]) return;
 
     // get edge
     uint64_t e = edges[tid];
@@ -562,7 +565,6 @@ static __global__ void select_collapse_edges_kernel(
         int3 ids = faces[vert2face[f]];
         if (propagated_costs[ids.x] != pack || propagated_costs[ids.y] != pack ||
             propagated_costs[ids.z] != pack) {
-            edge_collapse_costs[tid] = INFINITY;
             return;
         }
     }
@@ -570,10 +572,105 @@ static __global__ void select_collapse_edges_kernel(
         int3 ids = faces[vert2face[f]];
         if (propagated_costs[ids.x] != pack || propagated_costs[ids.y] != pack ||
             propagated_costs[ids.z] != pack) {
-            edge_collapse_costs[tid] = INFINITY;
             return;
         }
     }
+    // All claim checks used the same immutable snapshot. Winners have disjoint
+    // complete stars, so these byte stores have one writer per vertex.
+    chosen_edges[tid] = 1;
+    active_edges[tid] = 0;
+    atomicAdd(progress + 1, 1);
+    for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; ++f) {
+        int3 ids = faces[vert2face[f]];
+        reserved_vertices[ids.x] = reserved_vertices[ids.y] = reserved_vertices[ids.z] = 1;
+    }
+    for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; ++f) {
+        int3 ids = faces[vert2face[f]];
+        reserved_vertices[ids.x] = reserved_vertices[ids.y] = reserved_vertices[ids.z] = 1;
+    }
+}
+
+
+static __global__ void initialize_active_edges_kernel(
+    const float* costs, float threshold, int E, uint8_t* active
+) {
+    int edge = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge < E) active[edge] = isfinite(costs[edge]) && costs[edge] <= threshold;
+}
+
+
+static __global__ void prune_collapse_edges_kernel(
+    const int3* faces, const uint64_t* edges,
+    const int* vert2face, const int* offsets,
+    const uint8_t* reserved, int E, uint8_t* active, int* progress
+) {
+    int edge = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge >= E || !active[edge]) return;
+    uint64_t key = edges[edge];
+    int endpoints[2] = {int(key >> 32), int(key & 0xFFFFFFFF)};
+    for (int i = 0; i < 2; ++i) {
+        int vertex = endpoints[i];
+        for (int f = offsets[vertex]; f < offsets[vertex+1]; ++f) {
+            int3 ids = faces[vert2face[f]];
+            if (reserved[ids.x] || reserved[ids.y] || reserved[ids.z]) {
+                active[edge] = 0;
+                return;
+            }
+        }
+    }
+    atomicAdd(progress, 1);
+}
+
+
+static __global__ void retain_chosen_costs_kernel(
+    const uint8_t* chosen, int E, float* costs
+) {
+    int edge = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge < E && !chosen[edge]) costs[edge] = INFINITY;
+}
+
+
+static void select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStream_t stream, bool timing) {
+    size_t V = ctx.vertices.size, E = ctx.edges.size;
+    // This CSR/CUB workspace is dead until compression. Keep active/chosen
+    // edges and reserved vertices separate from the 8V endpoint-min workspace.
+    size_t state_bytes = 2 * E + V;
+    size_t progress_offset = (state_bytes + sizeof(int) - 1) & ~(sizeof(int) - 1);
+    ctx.cub_temp_storage.resize(progress_offset + 2 * sizeof(int));
+    auto* active = reinterpret_cast<uint8_t*>(ctx.cub_temp_storage.ptr);
+    auto* chosen = active + E;
+    auto* reserved = chosen + E;
+    auto* progress = reinterpret_cast<int*>(active + progress_offset);
+    CUDA_CHECK(cudaMemsetAsync(active, 0, progress_offset + 2 * sizeof(int), stream));
+    initialize_active_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        ctx.edge_collapse_costs.ptr, threshold, E, active);
+    CUDA_CHECK(cudaGetLastError());
+
+    int counts[2], waves = 0, total_chosen = 0;
+    do {
+        CUDA_CHECK(cudaMemsetAsync(progress, 0, 2 * sizeof(int), stream));
+        select_collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            ctx.faces.ptr, ctx.edges.ptr, ctx.vert2face.ptr, ctx.vert2face_offset.ptr,
+            ctx.edge_collapse_costs.ptr, ctx.propagated_costs.ptr,
+            active, chosen, reserved, progress, E);
+        CUDA_CHECK(cudaGetLastError());
+        prune_collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            ctx.faces.ptr, ctx.edges.ptr, ctx.vert2face.ptr, ctx.vert2face_offset.ptr,
+            reserved, E, active, progress);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(counts, progress, sizeof(counts), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        ++waves;
+        total_chosen += counts[1];
+        // A lowest packed key among remaining candidates always wins. No
+        // arbitrary wave cap silently substitutes a non-maximal batch.
+        TORCH_CHECK(counts[0] == 0 || counts[1] > 0, "[CuMesh] simplify_selection_no_progress");
+        if (counts[0]) propagate_cost(ctx, stream, active);
+    } while (counts[0]);
+    retain_chosen_costs_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        chosen, E, ctx.edge_collapse_costs.ptr);
+    CUDA_CHECK(cudaGetLastError());
+    if (timing) std::cout << "collapse_selection: waves=" << waves << " chosen=" << total_chosen << std::endl;
 }
 
 
@@ -666,7 +763,8 @@ static __global__ void compress_faces_kernel(
 void collapse_edges(
     CuMesh& ctx,
     float collapse_thresh,
-    cudaStream_t stream
+    cudaStream_t stream,
+    bool timing
 ) {
     size_t V = ctx.vertices.size;
     size_t F = ctx.faces.size;
@@ -684,10 +782,7 @@ void collapse_edges(
         1
     );
     CUDA_CHECK(cudaGetLastError());
-    select_collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-        ctx.faces.ptr, ctx.edges.ptr, ctx.vert2face.ptr, ctx.vert2face_offset.ptr,
-        ctx.edge_collapse_costs.ptr, ctx.propagated_costs.ptr, E, collapse_thresh);
-    CUDA_CHECK(cudaGetLastError());
+    select_maximal_collapse_batch(ctx, collapse_thresh, stream, timing);
 
     collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.vertices.ptr,
@@ -805,7 +900,7 @@ std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambd
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    collapse_edges(*this, threshold, stream);
+    collapse_edges(*this, threshold, stream, timing);
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();

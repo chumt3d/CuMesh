@@ -129,6 +129,11 @@ def reduce_surface(
         or settings.cost_normalization_mm <= 0
     ):
         raise ValueError("cost_normalization_mm must be positive and finite")
+    maximum_cost_unit = math.sqrt(
+        torch.finfo(torch.float32).max / CUMESH_INITIAL_NORMALIZED_THRESHOLD
+    )
+    if settings.cost_normalization_mm > maximum_cost_unit:
+        raise ValueError("initial QEM threshold must be representable as float32")
     initial_threshold = (
         CUMESH_INITIAL_NORMALIZED_THRESHOLD * settings.cost_normalization_mm**2
     )

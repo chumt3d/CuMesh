@@ -8,7 +8,7 @@ from tqdm import tqdm
 from .xatlas import Atlas
 from . import _C
 
-SIMPLIFICATION_POLICY_VERSION = "cumesh.simplicial-link-and-single-fan.v1"
+SIMPLIFICATION_POLICY_VERSION = "cumesh.simplicial-link-and-single-fan.v2"
 
 
 class SimplificationFailure(RuntimeError):
@@ -506,7 +506,7 @@ class CuMesh:
                 if verbose:
                     pbar.set_description(f"Simplifying [thres={thresh:.2e}]")
                 step_started = time.monotonic()
-                new_num_vert, new_num_face = self.cu_mesh.simplify_step(lambda_edge_length, lambda_skinny, thresh, False)
+                new_num_vert, new_num_face = self.cu_mesh.simplify_step(lambda_edge_length, lambda_skinny, thresh, options.get('timing', False))
                 self.last_simplification["steps"].append({
                     "faces_before": num_face, "faces_after": new_num_face,
                     "threshold": thresh, "seconds": time.monotonic() - step_started,
