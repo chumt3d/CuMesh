@@ -155,29 +155,37 @@ def _expand_frontier(
 
 
 @wp.kernel
-def _union_edges(edges: wp.array(dtype=wp.vec2i), parents: wp.array(dtype=wp.int32)):
+def _hook_edges(edges: wp.array(dtype=wp.vec2i), parents: wp.array(dtype=wp.int32)):
     edge = edges[wp.tid()]
-    a = edge[0]
-    b = edge[1]
-    while a != b:
-        while parents[a] != a:
-            a = parents[a]
-        while parents[b] != b:
-            b = parents[b]
-        if a != b:
-            hi = wp.max(a, b)
-            lo = wp.min(a, b)
-            if wp.atomic_cas(parents, hi, hi, lo) == hi:
-                break
+    a = parents[edge[0]]
+    b = parents[edge[1]]
+    if a != b:
+        wp.atomic_min(parents, wp.max(a, b), wp.min(a, b))
 
 
-@wp.kernel
-def _roots(parents: wp.array(dtype=wp.int32), roots: wp.array(dtype=wp.int32)):
-    i = wp.tid()
-    p = i
-    while parents[p] != p:
-        p = parents[p]
-    roots[i] = p
+def _component_labels(edges, vertex_count, stream, check):
+    """Bounded hooks and pointer jumping, with deadlines between O(E+V) rounds.
+
+    Parents decrease within the real component. No kernel walks a variable-length
+    parent chain. Convergence requires stable roots and agreement along all edges.
+    """
+    parents = torch.arange(vertex_count, dtype=torch.int32, device=edges.device)
+    rounds = 0
+    edge_array = wp.from_torch(edges.int(), dtype=wp.vec2i, requires_grad=False)
+    while True:
+        check("component labeling")
+        wp.launch(
+            _hook_edges,
+            dim=edges.shape[0],
+            inputs=[edge_array, wp.from_torch(parents, requires_grad=False)],
+            stream=stream,
+        )
+        jumped = parents[parents.long()]
+        rounds += 1
+        stable = torch.equal(jumped, parents)
+        parents = jumped
+        if stable and bool((parents[edges[:, 0]] == parents[edges[:, 1]]).all().item()):
+            return parents, rounds
 
 
 def _triangle_table():
@@ -333,10 +341,8 @@ def wrap_surface(
             values = bvh.unsigned_distance(
                 ((coords.float() + 0.5) / base - 0.5) * scale + center
             )[0]
-            # Upstream uses 0.87 (rounded sqrt(3)/2); use exact conservative radius.
-            coords = coords[
-                (values - settings.offset_mm).abs() <= math.sqrt(3) / 2 * scale / base
-            ]
+            # Preserve upstream's 0.87 rounded-up diagonal radius and margin.
+            coords = coords[(values - settings.offset_mm).abs() <= 0.87 * scale / base]
             evidence["refinement"].append(
                 {"resolution": base, "active_cells": coords.shape[0]}
             )
@@ -539,20 +545,10 @@ def wrap_surface(
             raise WrapFailure(
                 "wrap_topology_invalid", {**evidence, "topology": topology}
             )
-        parents = torch.arange(out_vertices.shape[0], dtype=torch.int32, device=device)
-        roots = torch.empty_like(parents)
-        wp.launch(
-            _union_edges,
-            dim=undirected.shape[0],
-            inputs=[array(undirected.int(), wp.vec2i), array(parents)],
-            stream=stream,
+        roots, labeling_rounds = _component_labels(
+            undirected, out_vertices.shape[0], stream, check
         )
-        wp.launch(
-            _roots,
-            dim=parents.numel(),
-            inputs=[array(parents), array(roots)],
-            stream=stream,
-        )
+        evidence["component_label_rounds"] = labeling_rounds
         topology["parts"] = torch.unique(roots).numel()
         if settings.require_one_part and topology["parts"] != 1:
             raise WrapFailure("wrap_multiple_parts", {**evidence, "topology": topology})
@@ -576,13 +572,15 @@ def wrap_surface(
                 "output_vertices": out_vertices.shape[0],
                 "output_faces": out_faces.shape[0],
                 "seconds": time.perf_counter() - started,
-                "wall_lower_bound_mm": 2
+                "wall_lower_bound_estimate_mm": 2
                 * (
                     settings.offset_mm
                     - interpolation_error
                     - evidence["projection_max_mm"]
                 ),
                 "cuda_torch_peak_bytes": torch.cuda.max_memory_allocated(device),
+                "wall_evidence_kind": "ideal_exact_udf_estimate_not_rounding_or_sliver_certified",
+                "final_wall_measurement": "not_run",
                 "final_product_validation": "not_run",
             }
         )

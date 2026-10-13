@@ -15,7 +15,8 @@ least upstream's 32. Actual voxels can be smaller. Projection ratio 0.1 is an
 explicit **experimental setting**, not an adopted policy. Its movement is capped
 by offset-minThickness/2-sqrt(3)*actualVoxel/2 and restricted to the original
 lattice edge. That preserves the tetra cell containing each surface patch and
-bounds distance from the source. The bound assumes an exact UDF; Warp's source
+estimates distance from the source. The payload labels this ideal exact-UDF
+estimate as uncertified for rounding and sliver omission; Warp's source
 sliver omission means final product thickness/fidelity still must be measured.
 
 ## Borrowed source and deliberate changes
@@ -23,7 +24,7 @@ sliver omission means final product thickness/fidelity still must be measured.
 - CuMesh MIT upstream `12289e1062f0603f2f0d0771b02e1395d247f26f`:
   `cumesh/remeshing.py` octree refinement around UDF-offset, cube coordinates,
   power-of-two level expansion, optional barycentric closest-point projection.
-  Use exact sqrt(3)/2 instead of rounded 0.87; Torch unique replaces the CUDA
+  Preserve upstream rounded-up 0.87 refinement radius; Torch unique replaces the CUDA
   sparse hash/corner ordering. No output/order/numerical equivalence claim.
 - Owned fork pilot `3d357b367d6b736baf7eb7cc702c0ac34029f345`:
   `experiments/narrow_band/.../warp_bvh.py` is copied unchanged. Warp1.13.0

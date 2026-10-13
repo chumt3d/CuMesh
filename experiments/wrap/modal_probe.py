@@ -47,7 +47,6 @@ def campaign(records: list[dict], run_id: str):
     import subprocess
     import time
     import threading
-    import pynvml
 
     root = Path("/evidence/make-solid-wrap") / run_id
     root.mkdir(parents=True, exist_ok=False)
@@ -55,17 +54,26 @@ def campaign(records: list[dict], run_id: str):
     rows = []
     samples = []
     done = threading.Event()
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
     def sample():
         while not done.wait(0.1):
-            samples.append(
-                {
-                    "seconds": time.monotonic() - started,
-                    "used": pynvml.nvmlDeviceGetMemoryInfo(handle).used,
-                }
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.used",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
             )
+            if result.returncode == 0:
+                samples.append(
+                    {
+                        "seconds": time.monotonic() - started,
+                        "used": int(result.stdout.strip()) * 1024**2,
+                    }
+                )
 
     sampler = threading.Thread(target=sample, daemon=True)
     sampler.start()
