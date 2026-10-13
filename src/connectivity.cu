@@ -211,11 +211,15 @@ static __global__ void get_edge_face_adjacency_kernel(
         }
         // Every face edge was emitted by get_edges on this same snapshot.
         if (lo >= E || edges[lo] != key) {
-            __trap(); // fail the CUDA operation on an inconsistent snapshot
+            atomicExch(edge_cursors + E, 1);
             return;
         }
         ids[corner] = lo;
         int slot = atomicAdd(edge_cursors + lo, 1);
+        if (slot >= edge2face_offset[lo+1] - edge2face_offset[lo]) {
+            atomicExch(edge_cursors + E + 1, 1);
+            return;
+        }
         edge2face[edge2face_offset[lo] + slot] = fid;
     }
     face2edge[fid] = {ids[0], ids[1], ids[2]};
@@ -261,8 +265,8 @@ void CuMesh::get_edge_face_adjacency() {
     // get edge-face adjacency
     // Scan scratch is no longer live after the D2H offset synchronization.
     // Reuse that owned opaque workspace for E integer cursors.
-    this->cub_temp_storage.resize(E * sizeof(int));
-    CUDA_CHECK(cudaMemsetAsync(this->cub_temp_storage.ptr, 0, E * sizeof(int), stream));
+    this->cub_temp_storage.resize((E + 2) * sizeof(int));
+    CUDA_CHECK(cudaMemsetAsync(this->cub_temp_storage.ptr, 0, (E + 2) * sizeof(int), stream));
     get_edge_face_adjacency_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         this->faces.ptr,
         this->edges.ptr,
@@ -273,6 +277,32 @@ void CuMesh::get_edge_face_adjacency() {
         this->face2edge.ptr
     );
     CUDA_CHECK(cudaGetLastError());
+    int adjacency_errors[2];
+    CUDA_CHECK(cudaMemcpyAsync(adjacency_errors,
+        reinterpret_cast<int*>(this->cub_temp_storage.ptr) + E,
+        sizeof(adjacency_errors), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (adjacency_errors[0] || adjacency_errors[1]) {
+        this->clear_cache(); // preserve geometry, discard incomplete adjacency
+        TORCH_CHECK(false, "[CuMesh] edge_adjacency_snapshot_invalid: missing_key=",
+                    adjacency_errors[0], ", count_mismatch=", adjacency_errors[1]);
+    }
+
+    // Segment order is canonical by face ID, including nonmanifold segments.
+    // Preserve the deterministic-adjacency lane's contract after atomic fill.
+    this->temp_storage.resize(total_edge_face_cnt * sizeof(int));
+    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortKeys(
+        nullptr, temp_storage_bytes,
+        this->edge2face.ptr, reinterpret_cast<int*>(this->temp_storage.ptr),
+        total_edge_face_cnt, E, this->edge2face_offset.ptr,
+        this->edge2face_offset.ptr + 1, 0, sizeof(int) * 8, stream));
+    this->cub_temp_storage.resize(temp_storage_bytes);
+    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortKeys(
+        this->cub_temp_storage.ptr, temp_storage_bytes,
+        this->edge2face.ptr, reinterpret_cast<int*>(this->temp_storage.ptr),
+        total_edge_face_cnt, E, this->edge2face_offset.ptr,
+        this->edge2face_offset.ptr + 1, 0, sizeof(int) * 8, stream));
+    swap_buffers(this->temp_storage, this->edge2face);
 }
 
 

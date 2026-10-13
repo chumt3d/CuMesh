@@ -528,7 +528,13 @@ class CuMesh:
             self.last_simplification.update(status=error.code, remaining_faces=error.remaining_faces)
             raise
         except Exception:
-            self.last_simplification.update(status="failed", remaining_faces=self.cu_mesh.num_faces())
+            self.last_simplification["status"] = "failed"
+            try:
+                self.last_simplification["remaining_faces"] = self.cu_mesh.num_faces()
+            except Exception:
+                # Preserve the original CUDA/backend error when the count query
+                # is unavailable; never replace it with a secondary failure.
+                self.last_simplification["remaining_faces"] = None
             raise
         finally:
             if verbose:
