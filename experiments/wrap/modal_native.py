@@ -51,7 +51,7 @@ if modal.is_local():
     retries=0,
     volumes={"/evidence": volume},
 )
-def compile_native(build_id: str, identity: dict):
+def compile_native(build_id: str, identity: dict, reuse_build_id: str):
     import subprocess
 
     directory = Path("/evidence/make-solid-wrap/native") / build_id
@@ -59,15 +59,18 @@ def compile_native(build_id: str, identity: dict):
     log_path = directory.parent / (build_id + ".log")
     try:
         with log_path.open("w") as log:
+            command = [
+                "/opt/mesh-generation-service/.venv/bin/python",
+                "/opt/wrap/native_build.py",
+                "--out",
+                str(directory),
+                "--identity",
+                json.dumps(identity),
+            ]
+            if reuse_build_id:
+                command += ["--reuse", str(directory.parent / reuse_build_id)]
             process = subprocess.run(
-                [
-                    "/opt/mesh-generation-service/.venv/bin/python",
-                    "/opt/wrap/native_build.py",
-                    "--out",
-                    str(directory),
-                    "--identity",
-                    json.dumps(identity),
-                ],
+                command,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 timeout=850,
@@ -129,7 +132,9 @@ def execute_controls(run_id: str, build_id: str):
 @app.local_entrypoint()
 def main(action: str, run_id: str, identity: str = "", build_id: str = ""):
     if action == "build":
-        call = compile_native.spawn(run_id, json.loads(Path(identity).read_text()))
+        call = compile_native.spawn(
+            run_id, json.loads(Path(identity).read_text()), build_id
+        )
     elif action == "controls":
         call = execute_controls.spawn(run_id, build_id)
     else:

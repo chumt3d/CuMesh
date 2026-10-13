@@ -113,6 +113,9 @@ def run(raw_directory, output, max_seconds, source_identity):
             raw["surface_vertices"], dtype=torch.float32, device="cuda"
         )
         raw_f = torch.tensor(raw["surface_faces"], dtype=torch.int32, device="cuda")
+        row["raw_max_vertex_face_degree"] = int(
+            np.bincount(raw["surface_faces"].reshape(-1), minlength=len(raw_v)).max()
+        )
         source = np.load(raw_directory / "source.npz", allow_pickle=False)
         scale = raw_leaf["sourceToMmScale"]
         source_span = np.ptp(
@@ -135,6 +138,9 @@ def run(raw_directory, output, max_seconds, source_identity):
         row["torch_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
         phase("serialize")
         vertices, faces = vv.cpu().numpy(), ff.cpu().numpy()
+        row["selected_max_vertex_face_degree"] = int(
+            np.bincount(faces.reshape(-1), minlength=len(vertices)).max()
+        )
         np.savez(
             output / "candidate-print.npz",
             surface_vertices=vertices,

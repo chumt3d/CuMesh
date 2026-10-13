@@ -166,6 +166,9 @@ inline __device__ bool collapse_link_valid(
     const int* offsets, const uint64_t* edges, int E,
     const uint8_t* boundary
 ) {
+    if (offsets[b + 1] - offsets[b] < offsets[a + 1] - offsets[a]) {
+        int tmp = a; a = b; b = tmp;
+    }
     int opposite[2] = {-1, -1};
     int edge_faces = 0;
     for (int i = offsets[a]; i < offsets[a + 1]; ++i) {
@@ -214,6 +217,86 @@ inline __device__ bool collapse_link_valid(
 }
 
 
+inline __device__ int face_corner(int3 face, int vertex) {
+    return face.x == vertex ? 0 : (face.y == vertex ? 1 : (face.z == vertex ? 2 : -1));
+}
+
+
+inline __device__ int corner_value(int3 values, int corner) {
+    return corner == 0 ? values.x : (corner == 1 ? values.y : values.z);
+}
+
+
+// Each oriented manifold vertex link is one path (boundary) or one cycle.
+// Walk its incident faces through precomputed edge adjacency, at most degree
+// steps. Total walk work is O(F); no per-vertex visited set/parent-chain walk.
+static __global__ void get_collapse_vertex_fans_kernel(
+    const int3* faces, const int* vert2face, const int* offsets,
+    const int3* face2edge, const int* edge2face, const int* edge_offsets,
+    const int* edge_counts, int V, uint8_t* manifold
+) {
+    int vertex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vertex >= V) return;
+    manifold[vertex] = 0;
+    int degree = offsets[vertex + 1] - offsets[vertex];
+    if (degree == 0) return;
+    int start = vert2face[offsets[vertex]], boundaries = 0, incoming_boundary = -1;
+    for (int i = offsets[vertex]; i < offsets[vertex + 1]; ++i) {
+        int fid = vert2face[i];
+        int3 face = faces[fid];
+        if (face.x == face.y || face.x == face.z || face.y == face.z) return;
+        int corner = face_corner(face, vertex);
+        if (corner < 0) return;
+        int3 eids = face2edge[fid];
+        int outgoing = edge_counts[corner_value(eids, corner)];
+        int incoming = edge_counts[corner_value(eids, (corner + 2) % 3)];
+        if ((outgoing != 1 && outgoing != 2) || (incoming != 1 && incoming != 2)) return;
+        boundaries += (outgoing == 1) + (incoming == 1);
+        if (incoming == 1) incoming_boundary = fid;
+    }
+    if (boundaries != 0 && boundaries != 2) return;
+    if (boundaries == 2) {
+        if (incoming_boundary < 0) return;
+        start = incoming_boundary;
+    }
+    int current = start;
+    for (int visited = 1; visited <= degree; ++visited) {
+        int3 face = faces[current];
+        int corner = face_corner(face, vertex);
+        if (corner < 0) return;
+        int eid = corner_value(face2edge[current], corner);
+        if (edge_counts[eid] == 1) {
+            manifold[vertex] = boundaries == 2 && visited == degree;
+            return;
+        }
+        int offset = edge_offsets[eid];
+        int first = edge2face[offset], second = edge2face[offset + 1];
+        int next = first == current ? second : (second == current ? first : -1);
+        if (next < 0 || next == current) return;
+        int next_corner = face_corner(faces[next], vertex);
+        if (next_corner < 0 ||
+            corner_value(faces[next], (next_corner + 2) % 3) != corner_value(face, (corner + 1) % 3)) return;
+        if (next == start) {
+            manifold[vertex] = boundaries == 0 && visited == degree;
+            return;
+        }
+        current = next;
+    }
+}
+
+
+void get_collapse_vertex_fans(CuMesh& ctx, cudaStream_t stream) {
+    ctx.get_edge_face_adjacency();
+    int V = ctx.vertices.size;
+    ctx.vert_is_manifold.resize(V);
+    get_collapse_vertex_fans_kernel<<<(V + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        ctx.faces.ptr, ctx.vert2face.ptr, ctx.vert2face_offset.ptr,
+        ctx.face2edge.ptr, ctx.edge2face.ptr, ctx.edge2face_offset.ptr,
+        ctx.edge2face_cnt.ptr, V, ctx.vert_is_manifold.ptr);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
 /**
  * Get the cost for each edge collapse
  *
@@ -236,6 +319,7 @@ static __global__ void get_edge_collapse_cost_kernel(
     const int* vert2face_offset,
     const uint64_t* edges,
     const uint8_t * vert_is_boundary,
+    const uint8_t * vert_is_manifold,
     const QEM* qems,
     const int V,
     const int F,
@@ -252,7 +336,8 @@ static __global__ void get_edge_collapse_cost_kernel(
     int e0 = int(e >> 32);
     int e1 = int(e & 0xFFFFFFFF);
 
-    if (!collapse_link_valid(e0, e1, faces, vert2face, vert2face_offset,
+    if (!vert_is_manifold[e0] || !vert_is_manifold[e1] ||
+        !collapse_link_valid(e0, e1, faces, vert2face, vert2face_offset,
                              edges, E, vert_is_boundary)) {
         edge_collapse_costs[tid] = INFINITY;
         return;
@@ -302,7 +387,9 @@ static __global__ void get_edge_collapse_cost_kernel(
     cost += lambda_skinny * skinny_cost * edge_length2;
 
     // Packed atomic ordering is defined only for finite nonnegative costs.
-    edge_collapse_costs[tid] = isfinite(cost) && cost >= 0.0f ? cost : INFINITY;
+    // The exact QEM is nonnegative; float32 cancellation can make it slightly
+    // negative. Clamp to +0 instead of rejecting useful planar contractions.
+    edge_collapse_costs[tid] = isfinite(cost) ? fmaxf(cost, 0.0f) : INFINITY;
 }
 
 
@@ -326,6 +413,7 @@ void get_edge_collapse_cost(
         ctx.vert2face_offset.ptr,
         ctx.edges.ptr,
         ctx.vert_is_boundary.ptr,
+        ctx.vert_is_manifold.ptr,
         reinterpret_cast<const QEM*>(ctx.temp_storage.ptr),
         V, F, E,
         lambda_edge_length, lambda_skinny,
@@ -434,27 +522,24 @@ void propagate_cost(
  * @param vertices_kept: the flag for vertices kept, shape (V)
  * @param faces_kept: the flag for faces kept, shape (F)
  */
-static __global__ void collapse_edges_kernel(
-    float3* vertices,
-    int3* faces,
-    uint64_t* edges,
+static __global__ void select_collapse_edges_kernel(
+    const int3* faces,
+    const uint64_t* edges,
     const int* vert2face,
     const int* vert2face_offset,
-    const float* edge_collapse_costs,
+    float* edge_collapse_costs,
     const uint64_t* propagated_costs,
-    const uint8_t * vert_is_boundary,
-    const int V,
-    const int F,
     const int E,
-    const float collapse_thresh,
-    int* vertices_kept,
-    int* faces_kept
+    const float collapse_thresh
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E) return;
 
     float cost = edge_collapse_costs[tid];
-    if (!isfinite(cost) || !(cost <= collapse_thresh)) return;
+    if (!isfinite(cost) || !(cost <= collapse_thresh)) {
+        edge_collapse_costs[tid] = INFINITY;
+        return;
+    }
 
     // get edge
     uint64_t e = edges[tid];
@@ -465,13 +550,34 @@ static __global__ void collapse_edges_kernel(
     for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
         int3 ids = faces[vert2face[f]];
         if (propagated_costs[ids.x] != pack || propagated_costs[ids.y] != pack ||
-            propagated_costs[ids.z] != pack) return;
+            propagated_costs[ids.z] != pack) {
+            edge_collapse_costs[tid] = INFINITY;
+            return;
+        }
     }
     for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
         int3 ids = faces[vert2face[f]];
         if (propagated_costs[ids.x] != pack || propagated_costs[ids.y] != pack ||
-            propagated_costs[ids.z] != pack) return;
+            propagated_costs[ids.z] != pack) {
+            edge_collapse_costs[tid] = INFINITY;
+            return;
+        }
     }
+}
+
+
+// Eligibility reads an immutable snapshot before the commit kernel starts.
+// Only disjoint-star winners then read/write faces during this commit kernel.
+static __global__ void collapse_edges_kernel(
+    float3* vertices, int3* faces, const uint64_t* edges,
+    const int* vert2face, const int* vert2face_offset,
+    const float* edge_collapse_costs, const uint8_t* vert_is_boundary,
+    int E, int* vertices_kept, int* faces_kept
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= E || !isfinite(edge_collapse_costs[tid])) return;
+    uint64_t e = edges[tid];
+    int e0 = int(e >> 32), e1 = int(e & 0xFFFFFFFF);
 
     // collapse edge
     Vec3f v0(vertices[e0]);
@@ -567,6 +673,11 @@ void collapse_edges(
         1
     );
     CUDA_CHECK(cudaGetLastError());
+    select_collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        ctx.faces.ptr, ctx.edges.ptr, ctx.vert2face.ptr, ctx.vert2face_offset.ptr,
+        ctx.edge_collapse_costs.ptr, ctx.propagated_costs.ptr, E, collapse_thresh);
+    CUDA_CHECK(cudaGetLastError());
+
     collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.vertices.ptr,
         ctx.faces.ptr,
@@ -574,10 +685,8 @@ void collapse_edges(
         ctx.vert2face.ptr,
         ctx.vert2face_offset.ptr,
         ctx.edge_collapse_costs.ptr,
-        ctx.propagated_costs.ptr,
         ctx.vert_is_boundary.ptr,
-        V, F, E,
-        collapse_thresh,
+        E,
         ctx.vertices_map.ptr,
         ctx.faces_map.ptr
     );
@@ -653,6 +762,7 @@ std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambd
     if (timing) start = std::chrono::high_resolution_clock::now();
     this->get_edges();
     this->get_boundary_info();
+    get_collapse_vertex_fans(*this, stream);
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();

@@ -215,6 +215,20 @@ def reduce_surface(
                 "target_faces": error.target_faces,
                 "remaining_faces": error.remaining_faces,
             }
+            if error.code == "simplify_deadline":
+                evidence["attempts"].append(
+                    {
+                        "attempt": attempt + 1,
+                        "target_faces": target,
+                        "status": "qem_deadline_raw_retained",
+                        "qem_stop": qem_stop,
+                        "qem_seconds": time.monotonic() - qem_started,
+                    }
+                )
+                del mesh
+                gc.collect()
+                break
+        qem_steps = mesh.last_simplification
         # Unreferenced positions are not mesh components and carry no geometry.
         mesh.remove_unreferenced_vertices()
         cv, cf = mesh.read()
@@ -230,6 +244,7 @@ def reduce_surface(
             "faces": len(cf),
             "qem_seconds": time.monotonic() - qem_started,
             "qem_stop": qem_stop,
+            "qem_steps": qem_steps,
         }
         evidence["attempts"].append(row)
         try:

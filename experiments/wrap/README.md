@@ -108,10 +108,19 @@ The conceptual source is [Dey et al., 1999](https://research-explorer.ista.ac.at
 the implementation is independently written under the repository MIT license.
 
 Cost-time validity rejects zero/nonfinite triangle area and nonpositive normal
-dot products. Packed cost admission is finite and nonnegative. Propagation and
+dot products. Float32 QEM cancellation is clamped to positive zero; nonfinite
+costs remain ineligible. Packed cost admission is finite and nonnegative. Propagation and
 commit own every vertex in each complete endpoint one-ring using the existing
 deterministic (cost,edge ID) ordering. This is stricter than legacy face-star
-ownership; its throughput impact is measured separately. Local link/normal
+ownership; its throughput impact is measured separately. Eligibility runs in a
+separate kernel over immutable faces before winners commit, preventing losing
+eligibility readers from racing with a winner's face changes. Endpoint fans are
+checked through existing face/edge adjacency: one oriented path or cycle, with
+at most degree steps per vertex and O(F) aggregate walk work. Disconnected fans,
+invalid incidence and inconsistent orientation cannot supply collapse endpoints.
+The adjacency adds existing cache storage proportional to F/E; measured native
+peak includes it. Its E+1 scan sentinel remains allocated for fully open inputs.
+Local link/normal
 conditions do not certify global self-intersection or local wall thickness.
 
 `simplify` preserves upstream threshold escalation but clamps it to float32's
@@ -124,3 +133,6 @@ handle failure honestly; an unreachable target is never forced by infinity.
 WRAP independently qualifies the readable result and removes only unreferenced
 positions. Root source, Python, toolchain and native artifact hashes are recorded
 by the dev CPU2 build; actual behavior is checked separately on L4.
+Unchanged objects can be reused only with identical source/header hashes and
+toolchain on the same immutable base image; build receipts bind reused object
+hashes and their previous build manifest. Changed translation units are rebuilt.

@@ -149,7 +149,7 @@ void CuMesh::get_edges() {
     // unique edges
     ScopedCudaTemporary<int> num_edges_storage(1, stream, operation.device_index());
     int* num_edges = num_edges_storage.get();
-    this->edge2face_cnt.resize(F * 3);
+    this->edge2face_cnt.resize(F * 3 + 1);
     CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
         nullptr, temp_storage_bytes,
         reinterpret_cast<uint64_t*>(this->temp_storage.ptr), this->edges.ptr, this->edge2face_cnt.ptr, num_edges,
@@ -163,6 +163,9 @@ void CuMesh::get_edges() {
     ));
     CUDA_CHECK(cudaMemcpyAsync(&this->edges.size, num_edges, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Edge adjacency scans E+1 values. Keep its zero sentinel allocated even
+    // when all 3F edges are unique (e.g. the single-triangle boundary control).
+    CUDA_CHECK(cudaMemsetAsync(this->edge2face_cnt.ptr + this->edges.size, 0, sizeof(int), stream));
     this->edge2face_cnt.size = this->edges.size;
     num_edges_storage.reset();
 }

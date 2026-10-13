@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -17,7 +18,7 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def build(out, identity):
+def build(out, identity, reuse=None):
     out.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     root = Path("/opt/native-src")
@@ -57,6 +58,47 @@ def build(out, identity):
     record_path.write_text(json.dumps(record, indent=2) + "\n")
     build_dir = out / "build"
     build_dir.mkdir()
+    record["reused_objects"] = []
+    if reuse:
+        previous = json.loads((reuse / "build.json").read_text())
+        headers = {
+            key: value
+            for key, value in record["files"].items()
+            if key.startswith("src/") and not key.endswith((".cu", ".cpp"))
+        }
+        same_headers = all(
+            previous["files"].get(key) == value for key, value in headers.items()
+        )
+        same_tools = all(
+            previous.get(key) == record.get(key)
+            for key in ("torch", "cuda", "arch", "nvcc", "c++")
+        )
+        if previous["status"] == "built" and same_headers and same_tools:
+            for name in (".ninja_log", ".ninja_deps"):
+                if (reuse / "build" / name).is_file():
+                    shutil.copy2(reuse / "build" / name, build_dir / name)
+            newest_source = max(p.stat().st_mtime for p in files)
+            for relative in sources:
+                key = "src/" + relative
+                object_name = Path(relative).stem + (
+                    ".cuda.o" if relative.endswith(".cu") else ".o"
+                )
+                old_object = reuse / "build" / object_name
+                if (
+                    previous["files"].get(key) == record["files"][key]
+                    and old_object.is_file()
+                ):
+                    target = build_dir / object_name
+                    shutil.copy2(old_object, target)
+                    os.utime(target, (max(time.time(), newest_source),) * 2)
+                    record["reused_objects"].append(
+                        {"source": key, "object": object_name, "sha256": sha(target)}
+                    )
+            record["reuse_authority"] = {
+                "build_json_sha256": sha(reuse / "build.json"),
+                "path": str(reuse),
+                "rule": "identical_source_headers_toolchain_immutable_base_image",
+            }
     # The unchanged xatlas extension is not rebuilt or used by reduction. Import
     # its package path without loading the old CuMesh _C (pybind type registry).
     installed = Path(importlib.util.find_spec("cumesh").origin).parent
@@ -97,5 +139,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--identity", required=True)
+    parser.add_argument("--reuse", type=Path)
     args = parser.parse_args()
-    print(json.dumps(build(args.out, json.loads(args.identity))), flush=True)
+    print(
+        json.dumps(build(args.out, json.loads(args.identity), args.reuse)), flush=True
+    )

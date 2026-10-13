@@ -496,16 +496,23 @@ class CuMesh:
         maximum_threshold = torch.finfo(torch.float32).max
         if not math.isfinite(thresh) or not 0 <= thresh <= maximum_threshold:
             raise ValueError("thresh must be finite, nonnegative and representable as float32")
+        self.last_simplification = {"target_faces": target_num_faces, "steps": [], "status": "running"}
         try:
             while True:
                 if deadline is not None and time.monotonic() >= deadline:
                     raise SimplificationFailure("simplify_deadline", target_num_faces, num_face)
                 if verbose:
                     pbar.set_description(f"Simplifying [thres={thresh:.2e}]")
+                step_started = time.monotonic()
                 new_num_vert, new_num_face = self.cu_mesh.simplify_step(lambda_edge_length, lambda_skinny, thresh, False)
+                self.last_simplification["steps"].append({
+                    "faces_before": num_face, "faces_after": new_num_face,
+                    "threshold": thresh, "seconds": time.monotonic() - step_started,
+                })
                 if verbose:
                     pbar.update(num_face - max(target_num_faces, new_num_face))
                 if new_num_face <= target_num_faces:
+                    self.last_simplification.update(status="target_reached", remaining_faces=new_num_face)
                     break
                 deleted = num_face - new_num_face
                 if deleted == 0 and thresh == maximum_threshold:
@@ -517,6 +524,9 @@ class CuMesh:
                     # A zero user threshold also advances to the format minimum.
                     thresh = min(maximum_threshold, max(thresh * 10, torch.finfo(torch.float32).tiny))
                 num_face = new_num_face
+        except SimplificationFailure as error:
+            self.last_simplification.update(status=error.code, remaining_faces=error.remaining_faces)
+            raise
         finally:
             if verbose:
                 pbar.close()
