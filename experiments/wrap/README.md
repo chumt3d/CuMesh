@@ -65,3 +65,31 @@ Install this isolated Python distribution through Socket Firewall with existing
 Torch>=2.5 and `warp-lang==1.13.0`; no CUDA/NVCC extension build is required. The
 parent production CuMesh distribution is untouched. Source base is the exact
 parent gitlink31e62e1d1adcb4cb7132989137d88aa5042fae54.
+
+## Bounded reduction pilot
+
+`reduce_surface` proposes a QEM reduction using the installed CuMesh Python API.
+Its checked source is owned-fork base31e62e1, with upstream defaults retained;
+runtime Python/native hashes and Torch/CUDA versions are recorded. A native
+binary without build provenance is labeled an untrusted proposer. Candidate
+qualification does not infer binary source correspondence from a package name.
+
+The Standard pilot allocates one quarter of the existing product's source
+tolerance (`8*0.001*source_bbox_diagonal_mm`) to sampled wrap/candidate deviation.
+The proposed target is raw surface area divided by the area of an equilateral
+triangle with circumradius equal to that budget. This density model does not
+bound QEM error. An advanced approximate target can replace the density target.
+There is one `simplify` call and at most one corrective call from a fresh raw
+snapshot, with proposal spacing halved (four times the target). The last passing
+mesh is retained. The existing native call has no cancellation hook; the pilot
+uses a hard subprocess deadline and preserves immutable volume-stored raw input.
+
+Each candidate checks exact edge incidence/direction, exact position coincidence,
+duplicate/degenerate faces, components and positive volume per component, then
+streams every referenced vertex and every face centroid through two-sided Warp
+queries. Distances and centroids are float32. Receipts explicitly label sampled
+maxima, exceedance fractions and completed counts. They establish no continuous
+surface or Hausdorff bound. Final exact vertex links/self-intersection, wall,
+source fidelity, cleanup, parts policy and actual STL/3MF bytes remain independent
+product gates. Driver memory is sampled during raw+native+candidate/BVH overlap;
+Torch allocation peaks alone omit native allocations.
