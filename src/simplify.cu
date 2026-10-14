@@ -950,9 +950,7 @@ void collapse_edges(
 }
 
 
-static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_length,float lambda_skinny,float threshold,bool timing,const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,double max_error_squared,const c10::cuda::CUDAStream* output_stream,double max_step_seconds) {
-    TORCH_CHECK(max_step_seconds>=0.0&&!std::isnan(max_step_seconds),"invalid step budget");
-    SimplificationControl control{ctx,max_step_seconds};
+static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_length,float lambda_skinny,float threshold,bool timing,const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,double max_error_squared,const c10::cuda::CUDAStream* output_stream,const SimplificationControl& control) {
     CuMeshOperationScope operation(ctx);
     control.check();
     cudaStream_t stream=operation.stream();
@@ -1025,7 +1023,9 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
 
 
 std::tuple<int,int> CuMesh::simplify_step(float edge,float skinny,float threshold,bool timing,double max_step_seconds) {
-    return simplify_step_impl(*this,edge,skinny,threshold,timing,nullptr,nullptr,INFINITY,nullptr,max_step_seconds);
+    TORCH_CHECK(max_step_seconds>=0.0&&!std::isnan(max_step_seconds),"invalid step budget");
+    SimplificationControl control{*this,max_step_seconds};
+    return simplify_step_impl(*this,edge,skinny,threshold,timing,nullptr,nullptr,INFINITY,nullptr,control);
 }
 
 std::map<std::string,uint64_t> CuMesh::simplification_admission_statistics() {
@@ -1048,7 +1048,10 @@ torch::Tensor CuMesh::initial_simplification_quadrics() {
 std::tuple<int,int,torch::Tensor> CuMesh::simplify_step_accumulated(
     const torch::Tensor& quadrics,float edge,float skinny,float threshold,double max_error_squared,bool timing,double max_step_seconds
 ) {
+    TORCH_CHECK(max_step_seconds>=0.0&&!std::isnan(max_step_seconds),"invalid step budget");
+    SimplificationControl control{*this,max_step_seconds};
     CuMeshOperationScope operation(*this);
+    control.check();
     TORCH_CHECK(quadrics.is_cuda()&&quadrics.get_device()==operation.device_index(),"quadrics must share canonical CUDA device");
     TORCH_CHECK(quadrics.scalar_type()==torch::kFloat64&&quadrics.is_contiguous(),"quadrics must be contiguous float64");
     TORCH_CHECK(quadrics.dim()==2&&quadrics.size(0)==vertices.size&&quadrics.size(1)==12,"quadrics must match vertices and 12-double layout");
@@ -1057,7 +1060,7 @@ std::tuple<int,int,torch::Tensor> CuMesh::simplify_step_accumulated(
     record_tensor_on_stream(quadrics,operation.execution_stream());
     torch::Tensor next;
     auto caller=operation.caller_stream();
-    auto counts=simplify_step_impl(*this,edge,skinny,threshold,timing,&quadrics,&next,max_error_squared,&caller,max_step_seconds);
+    auto counts=simplify_step_impl(*this,edge,skinny,threshold,timing,&quadrics,&next,max_error_squared,&caller,control);
     return std::make_tuple(std::get<0>(counts),std::get<1>(counts),next);
 }
 
