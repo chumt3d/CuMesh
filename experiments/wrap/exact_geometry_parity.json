@@ -1,0 +1,128 @@
+{
+  "reference": {
+    "repository": "github.com/chumt3d/tiny3d",
+    "commit": "f1b90a7f3802fe1f34d62790cdd2f74242a483d4",
+    "path": "services/mesh-generation-service/app/s4_gpu_geometry_audit.py",
+    "file_sha256": "296b8b8d9aadacb404b44a9658c6c59ca749f0182940f423f7c28c82a6552a68",
+    "runtime": "Warp 1.13.0, fuse_fp=False"
+  },
+  "native_header": "src/exact_geometry/predicates.h",
+  "functions": [
+    {
+      "reference": "_two_sum",
+      "reference_body_sha256": "473b1a4a639faf127aea86d3e717bfc6dee1863fe29da5dfe7f951e2c52be294",
+      "native": "two_sum"
+    },
+    {
+      "reference": "_two_product",
+      "reference_body_sha256": "3080db1d23c1d2cc774caa9540d984a1f108842a4d5651952e03b557394ea00e",
+      "native": "two_product"
+    },
+    {
+      "reference": "_row",
+      "reference_body_sha256": "75da6a94797a703b431844c9cd5d7529254730c0d0406dfe518ce33e3b9d9f29",
+      "native": "row"
+    },
+    {
+      "reference": "_orient3d_exact",
+      "reference_body_sha256": "dde002439a8f34e9a329a682eb82a21c352900efdce70ac3ca427aa8e76530fe",
+      "native": "orient3d_exact"
+    },
+    {
+      "reference": "_orient3d",
+      "reference_body_sha256": "2cf428224b7a3e1d32a7756a111348d7c33c01dfa7444badaab108152894e8af",
+      "native": "orient3d"
+    },
+    {
+      "reference": "_orient2d",
+      "reference_body_sha256": "01da787cc9a0cd690beb686204ed78746955883d75838f50c5d22a0645a8f0a2",
+      "native": "orient2d"
+    },
+    {
+      "reference": "_dominant_axis",
+      "reference_body_sha256": "f3acfdd4d27cdcf75e6f1d1b8534cfc0691efc61eb4583bfe1cc11a152a57688",
+      "native": "dominant_axis"
+    },
+    {
+      "reference": "_near_underflow",
+      "reference_body_sha256": "7377e52d542b2c8427686bd529ec75c2885b58e1608876fb84bc6833dccf3f3f",
+      "native": "near_underflow"
+    },
+    {
+      "reference": "_zero_area",
+      "reference_body_sha256": "a1d867cb31b0308d23f0b031dc45c052e6553b43ec8d68fa64ec755d3d996faa",
+      "native": "zero_area"
+    },
+    {
+      "reference": "_segment_meets_triangle_projected",
+      "reference_body_sha256": "1eea89facd222a49b4885cc7f3c581b323d5491469032c77b4a24597546b8db3",
+      "native": "segment_projected"
+    },
+    {
+      "reference": "_segment_meets_triangle_in_plane",
+      "reference_body_sha256": "5ef3b6826deb95b2a77720784fe0d1ae74c23341a841bc6eeb1f3244ac1d0bd5",
+      "native": "segment_in_plane"
+    },
+    {
+      "reference": "_projections_disjoint",
+      "reference_body_sha256": "4cce0201ab16fb60be45a6f929f594f1c7a3b1c9431ec097ae826f7308fd8cdf",
+      "native": "projections_disjoint"
+    },
+    {
+      "reference": "_projections_meet_only_at_shared_vertex",
+      "reference_body_sha256": "a025109945dc3cf91e02db3c04bd59598903ea3a1b7e83ffc124d250428c8817",
+      "native": "projections_shared_vertex"
+    },
+    {
+      "reference": "_segment_meets_triangle_signed",
+      "reference_body_sha256": "c5392a0a45214382a621b2123378236b5e567f26bf899a25e46e0984c630a9c6",
+      "native": "segment_signed"
+    },
+    {
+      "reference": "_segment_meets_triangle",
+      "reference_body_sha256": "0253621b8391983f69c0c18d3f6684cccbfd151477ee28937f22f321ffcf8636",
+      "native": "segment"
+    },
+    {
+      "reference": "_either_meets",
+      "reference_body_sha256": "70e372c1697e8183d2f17c23ea4f9a58eb3897ac86ae4ea2daf9ea8cef88d4ad",
+      "native": "either"
+    },
+    {
+      "reference": "_shared_edge_decision",
+      "reference_body_sha256": "980ff7d72c5952c3e0c84be0d5795de107bd3c70738c838934cb46685ec64fb5",
+      "native": "shared_edge"
+    },
+    {
+      "reference": "_nonadjacent_decision",
+      "reference_body_sha256": "af15ed0e85e63be1d14a7b919d374e592b6e548455b4f50ac3bb558f93493563",
+      "native": "nonadjacent"
+    },
+    {
+      "reference": "_pair_decision",
+      "reference_body_sha256": "3e7697a60ac2540eb24c38d8aacd10e9c182c0fcfde62666a2028b8efb4eb977",
+      "native": "pair"
+    }
+  ],
+  "preserved": [
+    "filtered orientation with exact expansion fallback and source term order",
+    "96-double expansion; float64 RN, no fused multiplication/addition",
+    "dominant projection ties x before y before z",
+    "zero-area and coordinate-underflow refusal",
+    "canonical-position contact groups; adjacent edge and single-vertex contacts are classified, not blindly excluded",
+    "decision codes 0 disjoint, 1 intersection, 2 undecided; +4 coplanar diagnostic"
+  ],
+  "deviations": [
+    "explicit capacity overflow returns undecided instead of unchecked expansion write; source arithmetic has at most 96 product addends",
+    "orient2d propagates this new undecided code rather than negating it",
+    "CUDA add/sub/mul use explicit round-to-nearest intrinsics; host uses volatile binary64 intermediates; QEM arithmetic flags unchanged"
+  ],
+  "license": {
+    "implementation": "repository MIT license",
+    "arithmetic_reference": "Shewchuk public-domain predicates.c; https://www.cs.cmu.edu/~quake/robust.html"
+  },
+  "evidence": {
+    "retained_selected_pair_codes": 500,
+    "status": "all 500 match reference codes on host; CUDA and negative contacts pending"
+  }
+}
