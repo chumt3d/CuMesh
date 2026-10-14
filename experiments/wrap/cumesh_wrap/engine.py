@@ -248,9 +248,10 @@ def _edge_interiors(world):
     # against the other endpoint, giving a rounded parameter of exactly 1.
     # Keep parameter endpoints open in their own fp64 representation too;
     # the actual stored-f32 coordinate predicate remains the admission authority.
+    # Apply one-sided bounds after reduction so an empty interval stays empty.
     lower = torch.maximum(lower, torch.full_like(lower, math.nextafter(0.0, 1.0)))
     upper = torch.minimum(upper, torch.full_like(upper, math.nextafter(1.0, 0.0)))
-    valid = changing.any(1) & (lower <= upper) & (lower > 0) & (upper < 1)
+    valid = changing.any(1) & (lower <= upper)
     return lower, upper, valid
 
 
