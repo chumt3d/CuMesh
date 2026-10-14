@@ -32,13 +32,20 @@ def _unsigned_distance(
             barycentrics[i] = wp.vec3(0.0, 0.0, 0.0)
 
 
-def validate_mesh(vertices: torch.Tensor, faces: torch.Tensor) -> None:
-    """Validate once before handing pointers to Warp/native CUDA code."""
+def validate_mesh(
+    vertices: torch.Tensor, faces: torch.Tensor, *, require_cuda: bool = True
+) -> None:
+    """Validate tensors; the pre-launch CPU check opts out of CUDA residency.
+
+    Runtime WRAP/BVH callers retain the default CUDA requirement. CPU preflight
+    validates the same shape, storage, value and same-device checks before a
+    paid allocation, without duplicating this input contract.
+    """
     if vertices.ndim != 2 or vertices.shape[1] != 3 or vertices.dtype != torch.float32:
         raise ValueError("vertices must be (N, 3) float32")
     if faces.ndim != 2 or faces.shape[1] != 3 or faces.dtype != torch.int32:
         raise ValueError("faces must be (M, 3) int32")
-    if not vertices.is_cuda or faces.device != vertices.device:
+    if (require_cuda and not vertices.is_cuda) or faces.device != vertices.device:
         raise ValueError("vertices and faces must be on the same CUDA device")
     if not vertices.is_contiguous() or not faces.is_contiguous():
         raise ValueError("vertices and faces must be contiguous")
