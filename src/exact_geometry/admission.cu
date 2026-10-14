@@ -1,5 +1,6 @@
 #include "admission.h"
 #include "predicates.h"
+#include "profile.h"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -467,6 +468,9 @@ struct ExactCollapseAdmission::Impl {
     check("input");
   }
   void build(Tree &t, int n, const int *input, Surface surface) {
+    private_profile::Range range(&t == &current
+                                     ? "CuMesh/admission/current_bvh_build"
+                                     : "CuMesh/admission/proposed_bvh_build");
     control();
     TreeView v = t.view(n);
     Box identity{{INFINITY, INFINITY, INFINITY},
@@ -503,6 +507,11 @@ struct ExactCollapseAdmission::Impl {
   }
   void query(Surface source, const int *input, int n, Surface target,
              TreeView tree, QueryKind kind, const int *base, int *output) {
+    const char *names[] = {"CuMesh/admission/current_full_audit",
+                           "CuMesh/admission/new_old",
+                           "CuMesh/admission/within_fan",
+                           "CuMesh/admission/competing_fan"};
+    private_profile::Range range(names[kind]);
     for (int offset = 0; offset < n; offset += query_tile) {
       control();
       int tile = std::min(query_tile, n - offset);
@@ -558,6 +567,8 @@ struct ExactCollapseAdmission::Impl {
     require(c.error != 3, "[CuMesh] simplify_spatial_input_undecided");
   }
   int filter() {
+    private_profile::Range range("CuMesh/admission/filter_selected");
+    private_profile::Range selection("CuMesh/admission/owner_fan_selection");
     control();
     CUMESH_SPATIAL_CUDA_CHECK(
         cudaMemsetAsync(owner.get(), 0xff, F * sizeof(int), stream));
@@ -583,6 +594,7 @@ struct ExactCollapseAdmission::Impl {
     CUMESH_SPATIAL_CUDA_CHECK(cudaMemcpyAsync(&fans, count.get(), sizeof(int),
                                               cudaMemcpyDeviceToHost, stream));
     CUMESH_SPATIAL_CUDA_CHECK(cudaStreamSynchronize(stream));
+    selection.finish();
     CUMESH_SPATIAL_CUDA_CHECK(
         cudaMemsetAsync(base_refused.get(), 0, E * sizeof(int), stream));
     CUMESH_SPATIAL_CUDA_CHECK(
@@ -602,6 +614,7 @@ struct ExactCollapseAdmission::Impl {
       CUMESH_SPATIAL_CUDA_CHECK(
           cudaMemsetAsync(refused.get(), 0, E * sizeof(int), stream));
     check("proposal");
+    private_profile::Range refusal("CuMesh/admission/apply_refusal");
     CUMESH_SPATIAL_CUDA_CHECK(
         cudaMemsetAsync(count.get(), 0, sizeof(int), stream));
     apply_refusal_kernel<<<(E + 255) / 256, 256, 0, stream>>>(

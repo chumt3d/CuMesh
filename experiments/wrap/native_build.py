@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -41,6 +42,10 @@ def build(out, identity, reuse=None):
         "shared.cu",
         "ext.cpp",
     ]
+    private_profile = os.environ.get("CUMESH_PRIVATE_NVTX_BUILD") == "1"
+    flags = ["-O3", "-std=c++17"] + (
+        ["-DCUMESH_PRIVATE_NVTX_PROFILE=1"] if private_profile else []
+    )
     record = {
         "source": identity,
         "files": {str(p.relative_to(root)): sha(p) for p in files},
@@ -49,6 +54,8 @@ def build(out, identity, reuse=None):
         "arch": "8.9",
         "max_jobs": 2,
         "status": "building",
+        "privateNvtxBuild": private_profile,
+        "compilerFlags": flags,
     }
     for tool in ("nvcc", "c++"):
         result = subprocess.run(
@@ -76,7 +83,8 @@ def build(out, identity, reuse=None):
             previous.get(key) == record.get(key)
             for key in ("torch", "cuda", "arch", "nvcc", "c++")
         )
-        if previous["status"] == "built" and same_headers and same_tools:
+        same_flags = previous.get("compilerFlags", ["-O3", "-std=c++17"]) == flags
+        if previous["status"] == "built" and same_headers and same_tools and same_flags:
             # Mounted-source timestamps invalidate Ninja's dependency database
             # across containers. Reuse hash-qualified objects explicitly, compile
             # changed TUs with the recorded Ninja commands, then relink once.
@@ -139,8 +147,9 @@ def build(out, identity, reuse=None):
             load(
                 name="_C",
                 sources=[str(root / "src" / path) for path in sources],
-                extra_cflags=["-O3", "-std=c++17"],
-                extra_cuda_cflags=["-O3", "-std=c++17"],
+                extra_cflags=flags,
+                extra_cuda_cflags=flags,
+                extra_ldflags=["-ldl"] if private_profile else [],
                 build_directory=str(build_dir),
                 verbose=True,
                 with_cuda=True,

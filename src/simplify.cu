@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include "shared.h"
 #include "exact_geometry/admission.h"
+#include "exact_geometry/profile.h"
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -648,6 +649,7 @@ static __global__ void retain_chosen_costs_kernel(
 
 
 static int select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStream_t stream, bool timing,const SimplificationControl& control) {
+    private_profile::Range profile_range("CuMesh/selection");
     size_t V = ctx.vertices.size, E = ctx.edges.size;
     // This CSR/CUB workspace is dead until compression. Keep active/chosen
     // edges and reserved vertices separate from the 8V endpoint-min workspace.
@@ -836,6 +838,7 @@ void collapse_edges(
     std::vector<std::unique_ptr<ScopedCudaTemporary<char>>> spatial_storage;
     std::unique_ptr<ExactCollapseAdmission> spatial;
     if(chosen) {
+        private_profile::Range constructor_range("CuMesh/admission/constructor_workspace_and_setup");
         spatial=std::make_unique<ExactCollapseAdmission>(
             CollapseSurface{ctx.vertices.ptr,ctx.faces.ptr,ctx.edges.ptr,ctx.vert2face.ptr,
                 ctx.vert2face_offset.ptr,ctx.edge_collapse_costs.ptr,int(F),int(E)},
@@ -844,6 +847,7 @@ void collapse_edges(
                 ctx.last_simplification_admission["workspaceBytesExcludingCudaLocalStorage"]+=bytes;
                 void* pointer=allocation->get();spatial_storage.push_back(std::move(allocation));return pointer;
             },control.remaining(),[&ctx]{return ctx.simplification_cancelled();});
+        constructor_range.finish();
         do {
             control.check();
             int selected=chosen;
@@ -852,6 +856,7 @@ void collapse_edges(
             if(chosen) break;
             // Ownership selection hid competing endpoint stars. A rejected
             // first batch cannot establish exhaustion of those alternatives.
+            private_profile::Range refill_range("CuMesh/refill_restore_propagate_select");
             restore_spatial_candidates_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,stream>>>(
                 original_costs.get(),spatial->refused_edges(),E,ctx.edge_collapse_costs.ptr);
             CUDA_CHECK(cudaGetLastError());
@@ -870,6 +875,7 @@ void collapse_edges(
     }
     // The newly introduced large Torch allocation must fail before geometry
     // changes. Disjoint chosen stars each remove exactly one endpoint.
+    private_profile::Range compaction_range("CuMesh/accepted_allocation_commit_compaction");
     if (next_quadrics) *next_quadrics=allocate_quadric_rows(int64_t(V)-chosen,previous_quadrics->options(),output_stream,execution_stream);
 
     // Admit every compaction workspace before committing geometry. Buffer
@@ -951,13 +957,17 @@ void collapse_edges(
 
 
 static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_length,float lambda_skinny,float threshold,bool timing,const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,double max_error_squared,const c10::cuda::CUDAStream* output_stream,const SimplificationControl& control) {
+    private_profile::Range step_range("CuMesh/step");
     CuMeshOperationScope operation(ctx);
     control.check();
     cudaStream_t stream=operation.stream();
     std::chrono::high_resolution_clock::time_point start, end;
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    ctx.get_vertex_face_adjacency();
+    {
+        private_profile::Range phase_range("CuMesh/adjacency");
+        ctx.get_vertex_face_adjacency();
+    }
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -965,9 +975,12 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    ctx.get_edges();
-    ctx.get_boundary_info();
-    get_collapse_vertex_fans(ctx, stream);
+    {
+        private_profile::Range phase_range("CuMesh/edges_boundary_fans");
+        ctx.get_edges();
+        ctx.get_boundary_info();
+        get_collapse_vertex_fans(ctx, stream);
+    }
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -992,7 +1005,10 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    get_edge_collapse_cost(ctx,lambda_edge_length,lambda_skinny,stream,quadrics,proposals.get(),max_error_squared);
+    {
+        private_profile::Range phase_range("CuMesh/edge_cost");
+        get_edge_collapse_cost(ctx,lambda_edge_length,lambda_skinny,stream,quadrics,proposals.get(),max_error_squared);
+    }
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -1000,7 +1016,10 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    propagate_cost(ctx, stream);
+    {
+        private_profile::Range phase_range("CuMesh/propagate_cost");
+        propagate_cost(ctx, stream);
+    }
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
