@@ -187,3 +187,26 @@ by the dev CPU2 build; actual behavior is checked separately on L4.
 Unchanged objects can be reused only with identical source/header hashes and
 toolchain on the same immutable base image; build receipts bind reused object
 hashes and their previous build manifest. Changed translation units are rebuilt.
+
+## Clean-input admission reuse
+
+Consecutive admitted native steps may reuse a pure proof of no forbidden or
+undecided triangle contacts. The first unknown input still receives a complete
+audit. A completed admitted enqueue is pending until the next existing selection
+synchronization observes success. Each geometry edit, cancellation notice and
+failed/quarantined operation invalidates the proof; successful cache-only clear
+preserves it. Current/proposed trees and every proposal query remain fresh. This
+is an owned/Python-method contract, not coverage of untracked external C++ writes
+through public geometry buffers, manifoldness or final printable validity.
+
+`certificate_controls.py --bridge PATH_TO_EXACT_GEOMETRY_BRIDGE --out OUTPUT`
+exercises the actual public methods on a small CUDA cube fixture, including
+consecutive steps without an extra inter-step synchronization, cache clear,
+cleanup invalidation, cancellation/clear, both swap directions and release/init
+with actually intersecting geometry. The CPU bridge checks complete output
+triangle pairs using the governing predicates. The continuation control also
+fails against the preceding ordinary binary because it repeats the full input
+audit. Run with the documented built CuMesh package on `PYTHONPATH`, two CPU
+threads and a GPU. These controls belong to native development/acceptance;
+ordinary consumers do not run them. Real allocator/mutex fault diagnostics and
+full-cohort producer/current-consumer proofs remain separate evidence.
