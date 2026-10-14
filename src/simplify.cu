@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
+#include <chrono>
 
 // Tiny3D modification: topology-preserving contractions and independent stars.
 // MIT (repository LICENSE). Link condition, not copied implementation:
@@ -15,6 +16,16 @@
 
 
 namespace cumesh {
+struct SimplificationControl {
+    const CuMesh& mesh;
+    double max_seconds;
+    std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
+    double remaining()const{return max_seconds-std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();}
+    void check()const {
+        TORCH_CHECK(!mesh.simplification_cancelled(),"[CuMesh] simplify_spatial_cancelled");
+        TORCH_CHECK(remaining()>0.0,"[CuMesh] simplify_spatial_deadline");
+    }
+};
 
 
 __device__ inline uint64_t pack_key_value_positive(int key, float value) {
@@ -636,7 +647,7 @@ static __global__ void retain_chosen_costs_kernel(
 }
 
 
-static int select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStream_t stream, bool timing) {
+static int select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStream_t stream, bool timing,const SimplificationControl& control) {
     size_t V = ctx.vertices.size, E = ctx.edges.size;
     // This CSR/CUB workspace is dead until compression. Keep active/chosen
     // edges and reserved vertices separate from the 8V endpoint-min workspace.
@@ -654,6 +665,7 @@ static int select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStrea
 
     int counts[2], waves = 0, total_chosen = 0;
     do {
+        control.check();
         CUDA_CHECK(cudaMemsetAsync(progress, 0, 2 * sizeof(int), stream));
         select_collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
             ctx.faces.ptr, ctx.edges.ptr, ctx.vert2face.ptr, ctx.vert2face_offset.ptr,
@@ -798,7 +810,7 @@ void collapse_edges(
     cudaStream_t stream,
     bool timing,const float3* proposed_positions,
     const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,int* merge_partner,double* merge_radius,
-    const c10::cuda::CUDAStream& output_stream,const c10::cuda::CUDAStream& execution_stream
+    const c10::cuda::CUDAStream& output_stream,const c10::cuda::CUDAStream& execution_stream,const SimplificationControl& control
 ) {
     size_t V = ctx.vertices.size;
     size_t F = ctx.faces.size;
@@ -820,7 +832,7 @@ void collapse_edges(
     ctx.last_simplification_admission.clear();
     ScopedCudaTemporary<float> original_costs(E,stream,device);
     CUDA_CHECK(cudaMemcpyAsync(original_costs.get(),ctx.edge_collapse_costs.ptr,E*sizeof(float),cudaMemcpyDeviceToDevice,stream));
-    int chosen=select_maximal_collapse_batch(ctx,collapse_thresh,stream,timing);
+    int chosen=select_maximal_collapse_batch(ctx,collapse_thresh,stream,timing,control);
     std::vector<std::unique_ptr<ScopedCudaTemporary<char>>> spatial_storage;
     std::unique_ptr<ExactCollapseAdmission> spatial;
     if(chosen) {
@@ -831,8 +843,9 @@ void collapse_edges(
                 auto allocation=std::make_unique<ScopedCudaTemporary<char>>(bytes,stream,device);
                 ctx.last_simplification_admission["workspaceBytesExcludingCudaLocalStorage"]+=bytes;
                 void* pointer=allocation->get();spatial_storage.push_back(std::move(allocation));return pointer;
-            });
+            },control.remaining(),[&ctx]{return ctx.simplification_cancelled();});
         do {
+            control.check();
             int selected=chosen;
             chosen=spatial->filter_selected();
             if(timing) std::cout << "collapse_spatial: selected=" << selected << " accepted=" << chosen << std::endl;
@@ -843,7 +856,7 @@ void collapse_edges(
                 original_costs.get(),spatial->refused_edges(),E,ctx.edge_collapse_costs.ptr);
             CUDA_CHECK(cudaGetLastError());
             propagate_cost(ctx,stream);
-            chosen=select_maximal_collapse_batch(ctx,collapse_thresh,stream,timing);
+            chosen=select_maximal_collapse_batch(ctx,collapse_thresh,stream,timing,control);
         } while(chosen);
         auto workspace_bytes=ctx.last_simplification_admission["workspaceBytesExcludingCudaLocalStorage"];
         ctx.last_simplification_admission=spatial->statistics();
@@ -869,6 +882,7 @@ void collapse_edges(
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr,face_scan_bytes,ctx.faces_map.ptr,F+1,stream));
     ctx.cub_temp_storage.resize(std::max(vertex_scan_bytes,face_scan_bytes));
 
+    control.check();
     collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.vertices.ptr,
         ctx.faces.ptr,
@@ -936,8 +950,11 @@ void collapse_edges(
 }
 
 
-static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_length,float lambda_skinny,float threshold,bool timing,const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,double max_error_squared,const c10::cuda::CUDAStream* output_stream) {
+static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_length,float lambda_skinny,float threshold,bool timing,const torch::Tensor* previous_quadrics,torch::Tensor* next_quadrics,double max_error_squared,const c10::cuda::CUDAStream* output_stream,double max_step_seconds) {
+    TORCH_CHECK(max_step_seconds>=0.0&&!std::isnan(max_step_seconds),"invalid step budget");
+    SimplificationControl control{ctx,max_step_seconds};
     CuMeshOperationScope operation(ctx);
+    control.check();
     cudaStream_t stream=operation.stream();
     std::chrono::high_resolution_clock::time_point start, end;
 
@@ -993,7 +1010,7 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
     }
 
     if (timing) start = std::chrono::high_resolution_clock::now();
-    collapse_edges(ctx,threshold,stream,timing,proposals.get(),previous_quadrics,next_quadrics,partners.get(),radii.get(),output_stream?*output_stream:operation.caller_stream(),operation.execution_stream());
+    collapse_edges(ctx,threshold,stream,timing,proposals.get(),previous_quadrics,next_quadrics,partners.get(),radii.get(),output_stream?*output_stream:operation.caller_stream(),operation.execution_stream(),control);
     if (timing) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         end = std::chrono::high_resolution_clock::now();
@@ -1007,8 +1024,8 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
 }
 
 
-std::tuple<int,int> CuMesh::simplify_step(float edge,float skinny,float threshold,bool timing) {
-    return simplify_step_impl(*this,edge,skinny,threshold,timing,nullptr,nullptr,INFINITY,nullptr);
+std::tuple<int,int> CuMesh::simplify_step(float edge,float skinny,float threshold,bool timing,double max_step_seconds) {
+    return simplify_step_impl(*this,edge,skinny,threshold,timing,nullptr,nullptr,INFINITY,nullptr,max_step_seconds);
 }
 
 std::map<std::string,uint64_t> CuMesh::simplification_admission_statistics() {
@@ -1029,7 +1046,7 @@ torch::Tensor CuMesh::initial_simplification_quadrics() {
 }
 
 std::tuple<int,int,torch::Tensor> CuMesh::simplify_step_accumulated(
-    const torch::Tensor& quadrics,float edge,float skinny,float threshold,double max_error_squared,bool timing
+    const torch::Tensor& quadrics,float edge,float skinny,float threshold,double max_error_squared,bool timing,double max_step_seconds
 ) {
     CuMeshOperationScope operation(*this);
     TORCH_CHECK(quadrics.is_cuda()&&quadrics.get_device()==operation.device_index(),"quadrics must share canonical CUDA device");
@@ -1040,7 +1057,7 @@ std::tuple<int,int,torch::Tensor> CuMesh::simplify_step_accumulated(
     record_tensor_on_stream(quadrics,operation.execution_stream());
     torch::Tensor next;
     auto caller=operation.caller_stream();
-    auto counts=simplify_step_impl(*this,edge,skinny,threshold,timing,&quadrics,&next,max_error_squared,&caller);
+    auto counts=simplify_step_impl(*this,edge,skinny,threshold,timing,&quadrics,&next,max_error_squared,&caller,max_step_seconds);
     return std::make_tuple(std::get<0>(counts),std::get<1>(counts),next);
 }
 

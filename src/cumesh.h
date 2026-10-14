@@ -606,9 +606,13 @@ public:
      * @param threshold The threshold for edge collapse cost.
      * @return A tuple of the number of vertices and the number of faces after simplification.
      */
-    std::tuple<int, int> simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing=false);
+    std::tuple<int, int> simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing=false,double max_step_seconds=INFINITY);
     torch::Tensor initial_simplification_quadrics();
-    std::tuple<int,int,torch::Tensor> simplify_step_accumulated(const torch::Tensor& quadrics,float lambda_edge_length,float lambda_skinny,float threshold,double max_error_squared,bool timing=false);
+    std::tuple<int,int,torch::Tensor> simplify_step_accumulated(const torch::Tensor& quadrics,float lambda_edge_length,float lambda_skinny,float threshold,double max_error_squared,bool timing=false,double max_step_seconds=INFINITY);
+    std::atomic<bool> simplification_cancel_requested{false};
+    void cancel_simplification() noexcept {simplification_cancel_requested.store(true,std::memory_order_release);}
+    void clear_simplification_cancel() noexcept {simplification_cancel_requested.store(false,std::memory_order_release);}
+    bool simplification_cancelled() const noexcept {return simplification_cancel_requested.load(std::memory_order_acquire);}
     std::map<std::string,uint64_t> last_simplification_admission;
     std::map<std::string,uint64_t> simplification_admission_statistics();
 

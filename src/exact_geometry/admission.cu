@@ -1,6 +1,7 @@
 #include "admission.h"
 #include "predicates.h"
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cub/cub.cuh>
 #include <cuda/atomic>
@@ -246,34 +247,72 @@ struct QueryCounts {
   unsigned long long undecided;
   int error;
 };
+// One unique-key width of node work per thread yields to host controls.
+// Exhausted quanta resume; they never certify an incomplete query as clean.
+constexpr int node_quantum = 64;
+struct QueryState {
+  int stack[66];
+  int size;
+  int done;
+  unsigned int visits;
+};
+__global__ void initialize_queries_kernel(QueryState *states, int count) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  states[i].size = 1;
+  states[i].stack[0] = 0;
+  states[i].done = 0;
+  states[i].visits = 0;
+}
+__device__ int atomic_flag(const int *flag) {
+  cuda::atomic_ref<int, cuda::thread_scope_device> value(
+      *const_cast<int *>(flag));
+  return value.load(cuda::memory_order_relaxed);
+}
 __global__ void query_kernel(Surface source, const int *source_ids,
                              int source_count, Surface target, TreeView tree,
                              QueryKind kind, const float *costs,
                              const int *base_refused, int *refused,
-                             QueryCounts *counts, int offset) {
-  int query = offset + blockIdx.x * blockDim.x + threadIdx.x;
-  if (query >= source_count || query >= offset + query_tile)
+                             QueryCounts *counts, int offset,
+                             QueryState *states, int *pending) {
+  int local = blockIdx.x * blockDim.x + threadIdx.x, query = offset + local;
+  if (query >= source_count || local >= query_tile)
+    return;
+  QueryState &state = states[local];
+  if (state.done)
     return;
   int face = source_ids[query],
       owner = kind == audit_current ? -1 : source.owner[face];
   Triangle t = triangle(source, face);
   Box box = bounds(t);
-  int stack[66], size = 1;
-  stack[0] = 0;
-  unsigned long long visits = 0, leaves = 0;
-  while (size) {
-    int node = stack[--size];
+  unsigned int visits = 0;
+  unsigned long long leaves = 0;
+  while (state.size && visits < node_quantum) {
+    if (atomic_flag(&counts->error)) {
+      state.done = 1;
+      break;
+    }
+    // Intrinsic/base refusal is monotone. Competing-fan flags are NOT
+    // used to prune: all pairs among stable base-eligible owners remain.
+    if ((kind == new_old || kind == within_fan) &&
+        atomic_flag(refused + owner)) {
+      state.done = 1;
+      break;
+    }
+    int node = state.stack[--state.size];
     ++visits;
     if (!overlaps(box, tree.boxes[node]))
       continue;
     if (node < tree.n - 1) {
-      if (size + 2 > 66) {
-        atomicExch(&counts->error, 1);
+      if (state.size + 2 > 66) {
+        atomicCAS(&counts->error, 0, 1);
+        state.done = 1;
         break;
       }
-      int2 k = tree.children[node];
-      stack[size++] = k.y;
-      stack[size++] = k.x;
+      int2 kids = tree.children[node];
+      state.stack[state.size++] = kids.y;
+      state.stack[state.size++] = kids.x;
       continue;
     }
     int other = tree.faces[node - (tree.n - 1)];
@@ -289,16 +328,14 @@ __global__ void query_kernel(Surface source, const int *source_ids,
          base_refused[other_owner]))
       continue;
     ++leaves;
-    Triangle target_triangle = triangle(target, other);
-    int result = contact(t, target_triangle);
+    Triangle other_triangle = triangle(target, other);
+    int result = contact(t, other_triangle);
     if (kind == new_old || kind == competing_fans) {
-      // A newly coincident contraction point could pinch an otherwise clean
-      // vertex link after exact welding. Refuse it even when contact is legal.
       float3 proposal = source.proposals[owner];
       for (int i = 0; i < 3; ++i)
-        if (proposal.x == target_triangle.p[i].x &&
-            proposal.y == target_triangle.p[i].y &&
-            proposal.z == target_triangle.p[i].z)
+        if (proposal.x == other_triangle.p[i].x &&
+            proposal.y == other_triangle.p[i].y &&
+            proposal.z == other_triangle.p[i].z)
           result = 1;
     }
     if (result == 0)
@@ -306,20 +343,31 @@ __global__ void query_kernel(Surface source, const int *source_ids,
     if (result == 2)
       atomicAdd(&counts->undecided, 1ULL);
     if (kind == audit_current) {
-      atomicExch(&counts->error, result == 2 ? 3 : 2);
-      continue;
+      atomicCAS(&counts->error, 0, result == 2 ? 3 : 2);
+      state.done = 1;
+      break;
     }
     int loser = owner;
     if (kind == competing_fans) {
       float a = costs[owner], b = costs[other_owner];
-      loser = (a > b || (a == b && owner > other_owner)) ? owner : other_owner;
+      loser = a > b || (a == b && owner > other_owner) ? owner : other_owner;
     }
     atomicExch(refused + loser, 1);
+    if (kind != competing_fans) {
+      state.done = 1;
+      break;
+    }
   }
-  atomicAdd(&counts->nodes, visits);
+  state.visits += visits;
+  atomicAdd(&counts->nodes, static_cast<unsigned long long>(visits));
   atomicAdd(&counts->leaves, leaves);
-  atomicAdd(&counts->queries, 1ULL);
-  atomicMax(&counts->max_nodes, unsigned(visits));
+  if (!state.size)
+    state.done = 1;
+  if (state.done) {
+    atomicAdd(&counts->queries, 1ULL);
+    atomicMax(&counts->max_nodes, state.visits);
+  } else
+    atomicAdd(pending, 1);
 }
 __global__ void apply_refusal_kernel(float *costs, const int *refused,
                                      int *ever_refused, int n, int *accepted) {
@@ -347,6 +395,18 @@ struct Tree {
 };
 } // namespace
 struct ExactCollapseAdmission::Impl {
+  std::chrono::steady_clock::time_point started =
+      std::chrono::steady_clock::now();
+  double max_seconds;
+  std::function<bool()> cancelled;
+  void control() const {
+    require(!cancelled(), "[CuMesh] simplify_spatial_cancelled");
+    require(std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          started)
+                    .count() < max_seconds,
+            "[CuMesh] simplify_spatial_deadline");
+  }
+
   std::map<std::string, uint64_t> statistics;
   CollapseSurface mesh;
   cudaStream_t stream;
@@ -359,17 +419,23 @@ struct ExactCollapseAdmission::Impl {
   WorkspaceArray<uint64_t> keys, sorted_keys;
   WorkspaceArray<Box> scene;
   WorkspaceArray<QueryCounts> counts;
+  WorkspaceArray<QueryState> query_states;
+  WorkspaceArray<int> pending;
   std::unique_ptr<WorkspaceArray<char>> workspace;
   size_t workspace_bytes = 0;
   Impl(CollapseSurface m, const float3 *p, cudaStream_t s,
-       const ExactCollapseAdmission::Allocator &allocate)
-      : mesh(m), stream(s), F(m.face_count), E(m.edge_count),
+       const ExactCollapseAdmission::Allocator &allocate, double seconds,
+       const std::function<bool()> &cancel)
+      : max_seconds(seconds), cancelled(cancel), mesh(m), stream(s),
+        F(m.face_count), E(m.edge_count),
         old{m.vertices, m.faces, m.edges, p, nullptr, false}, new_surface(old),
         current(F, allocate), proposed(F, allocate), ids(F, allocate),
         fan_ids(F, allocate), owner(F, allocate), refused(E, allocate),
         base_refused(E, allocate), ever_refused(E, allocate),
         count(1, allocate), flags(F, allocate), keys(F, allocate),
-        sorted_keys(F, allocate), scene(1, allocate), counts(1, allocate) {
+        sorted_keys(F, allocate), scene(1, allocate), counts(1, allocate),
+        query_states(std::min(F, query_tile), allocate), pending(1, allocate) {
+    control();
     new_surface.owner = owner.get();
     new_surface.proposed = true;
     size_t bytes = 0;
@@ -401,6 +467,7 @@ struct ExactCollapseAdmission::Impl {
     check("input");
   }
   void build(Tree &t, int n, const int *input, Surface surface) {
+    control();
     TreeView v = t.view(n);
     Box identity{{INFINITY, INFINITY, INFINITY},
                  {-INFINITY, -INFINITY, -INFINITY}};
@@ -437,12 +504,38 @@ struct ExactCollapseAdmission::Impl {
   void query(Surface source, const int *input, int n, Surface target,
              TreeView tree, QueryKind kind, const int *base, int *output) {
     for (int offset = 0; offset < n; offset += query_tile) {
+      control();
       int tile = std::min(query_tile, n - offset);
-      query_kernel<<<(tile + query_threads - 1) / query_threads, query_threads,
-                     0, stream>>>(source, input, n, target, tree, kind,
-                                  mesh.costs, base, output, counts.get(),
-                                  offset);
+      initialize_queries_kernel<<<(tile + query_threads - 1) / query_threads,
+                                  query_threads, 0, stream>>>(
+          query_states.get(), tile);
       CUMESH_SPATIAL_CUDA_CHECK(cudaGetLastError());
+      int outstanding;
+      do {
+        control();
+        CUMESH_SPATIAL_CUDA_CHECK(
+            cudaMemsetAsync(pending.get(), 0, sizeof(int), stream));
+        query_kernel<<<(tile + query_threads - 1) / query_threads,
+                       query_threads, 0, stream>>>(
+            source, input, n, target, tree, kind, mesh.costs, base, output,
+            counts.get(), offset, query_states.get(), pending.get());
+        CUMESH_SPATIAL_CUDA_CHECK(cudaGetLastError());
+        CUMESH_SPATIAL_CUDA_CHECK(
+            cudaMemcpyAsync(&outstanding, pending.get(), sizeof(int),
+                            cudaMemcpyDeviceToHost, stream));
+        CUMESH_SPATIAL_CUDA_CHECK(cudaStreamSynchronize(stream));
+        control();
+        ++statistics["queryQuanta"];
+      } while (outstanding);
+      // The first global witness stops this tile and prevents further enqueue.
+      QueryCounts observed{};
+      CUMESH_SPATIAL_CUDA_CHECK(
+          cudaMemcpyAsync(&observed, counts.get(), sizeof(observed),
+                          cudaMemcpyDeviceToHost, stream));
+      CUMESH_SPATIAL_CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (observed.error) {
+        check(kind == audit_current ? "input" : "proposal");
+      }
     }
   }
   void check(const char *stage) {
@@ -465,6 +558,7 @@ struct ExactCollapseAdmission::Impl {
     require(c.error != 3, "[CuMesh] simplify_spatial_input_undecided");
   }
   int filter() {
+    control();
     CUMESH_SPATIAL_CUDA_CHECK(
         cudaMemsetAsync(owner.get(), 0xff, F * sizeof(int), stream));
     CUMESH_SPATIAL_CUDA_CHECK(
@@ -522,12 +616,15 @@ struct ExactCollapseAdmission::Impl {
     return accepted;
   }
 };
-ExactCollapseAdmission::ExactCollapseAdmission(CollapseSurface m,
-                                               const float3 *p, cudaStream_t s,
-                                               const Allocator &allocate) {
+ExactCollapseAdmission::ExactCollapseAdmission(
+    CollapseSurface m, const float3 *p, cudaStream_t s,
+    const Allocator &allocate, double max_seconds,
+    const std::function<bool()> &cancelled) {
+  require(max_seconds > 0.0 && !std::isnan(max_seconds),
+          "[CuMesh] simplify_spatial_deadline");
   require(m.face_count > 0 && m.face_count <= INT_MAX / 2 && m.edge_count >= 0,
           "[CuMesh] simplify_spatial_index_overflow");
-  impl_ = std::make_unique<Impl>(m, p, s, allocate);
+  impl_ = std::make_unique<Impl>(m, p, s, allocate, max_seconds, cancelled);
 }
 ExactCollapseAdmission::~ExactCollapseAdmission() = default;
 int ExactCollapseAdmission::filter_selected() { return impl_->filter(); }

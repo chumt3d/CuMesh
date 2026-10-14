@@ -20,7 +20,9 @@ class ExactCollapseAdmission {
 public:
   using Allocator = std::function<void *(size_t)>;
   ExactCollapseAdmission(CollapseSurface mesh, const float3 *proposals,
-                         cudaStream_t stream, const Allocator &allocate);
+                         cudaStream_t stream, const Allocator &allocate,
+                         double max_seconds,
+                         const std::function<bool()> &cancelled);
   ~ExactCollapseAdmission();
   ExactCollapseAdmission(const ExactCollapseAdmission &) = delete;
   ExactCollapseAdmission &operator=(const ExactCollapseAdmission &) = delete;

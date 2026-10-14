@@ -466,6 +466,10 @@ class CuMesh:
         """
         self.cu_mesh.unify_face_orientations()
     
+    def cancel_simplification(self):
+        """Request typed cancellation at the next bounded native checkpoint."""
+        self.cu_mesh.cancel_simplification()
+
     def simplify(self, target_num_faces: int | None = None, verbose: bool=False, options: dict={}):
         """Accumulate original planes with optional error-first admission.
 
@@ -503,6 +507,7 @@ class CuMesh:
         if target_num_faces is not None and faces<=target_num_faces:
             self.last_simplification.update(status="target_reached",remaining_faces=faces)
             return
+        self.cu_mesh.clear_simplification_cancel()
         quadrics=None
         pbar=tqdm(total=faces,desc="Simplifying",disable=not verbose)
         try:
@@ -513,16 +518,26 @@ class CuMesh:
                 started=time.monotonic()
                 _,next_faces,next_quadrics=self.cu_mesh.simplify_step_accumulated(
                     quadrics,options.get('lambda_edge_length',1e-2),options.get('lambda_skinny',1e-3),
-                    threshold,max_error_squared,options.get('timing',False))
+                    threshold,max_error_squared,options.get('timing',False),
+                    math.inf if deadline is None else max(0.0,deadline-time.monotonic()))
                 quadrics=next_quadrics
-                self.last_simplification['steps'].append({"faces_before":faces,"faces_after":next_faces,"threshold":threshold,"seconds":time.monotonic()-started,"spatialAdmission":self.cu_mesh.simplification_admission_statistics()})
+                spatial=self.cu_mesh.simplification_admission_statistics()
+                self.last_simplification['steps'].append({"faces_before":faces,"faces_after":next_faces,"threshold":threshold,"seconds":time.monotonic()-started,"spatialAdmission":spatial})
                 pbar.update(faces-next_faces)
+                if self.cu_mesh.simplification_cancelled():
+                    raise SimplificationFailure("simplify_spatial_cancelled",target_num_faces,next_faces)
+                if deadline is not None and time.monotonic()>=deadline:
+                    raise SimplificationFailure("simplify_deadline",target_num_faces,next_faces)
                 if target_num_faces is not None and next_faces<=target_num_faces:
                     self.last_simplification.update(status="target_reached",remaining_faces=next_faces)
                     break
                 deleted=faces-next_faces
                 if deleted==0 and error_limit is not None:
-                    self.last_simplification.update(status="error_topology_or_spatial_limit_reached",remaining_faces=next_faces)
+                    self.last_simplification.update(
+                        status="spatial_admission_limit_reached" if spatial.get("selectionBatches",0)>0 else "error_or_topology_limit_reached",
+                        remaining_faces=next_faces,
+                        floorReason="conservative_exact_spatial_admission" if spatial.get("selectionBatches",0)>0 else "metric_or_topology",
+                        competingResolver="deterministic_conservative_nonmaximal")
                     break
                 if deleted==0 and threshold==maximum:
                     raise SimplificationFailure("simplify_no_legal_progress",target_num_faces,next_faces)
@@ -541,6 +556,8 @@ class CuMesh:
                 self.last_simplification.update(status=code,remaining_faces=faces)
                 raise SimplificationFailure(code,target_num_faces,faces) from error
             self.last_simplification['status']='failed'
+            try: self.last_simplification['remaining_faces']=self.cu_mesh.num_faces()
+            except Exception: self.last_simplification['remaining_faces']=None
             raise
         except Exception:
             self.last_simplification['status']='failed'

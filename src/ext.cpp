@@ -97,9 +97,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("remove_non_manifold_faces", &cumesh::CuMesh::remove_non_manifold_faces)
         .def("remove_small_connected_components", &cumesh::CuMesh::remove_small_connected_components)
         .def("unify_face_orientations", &cumesh::CuMesh::unify_face_orientations)
-        .def("simplify_step", &cumesh::CuMesh::simplify_step)
+        .def("simplify_step", &cumesh::CuMesh::simplify_step,
+            py::arg("edge"),py::arg("skinny"),py::arg("threshold"),py::arg("timing")=false,
+            py::arg("max_step_seconds")=INFINITY,py::call_guard<py::gil_scoped_release>())
         .def("initial_simplification_quadrics", &cumesh::CuMesh::initial_simplification_quadrics)
-        .def("simplify_step_accumulated", &cumesh::CuMesh::simplify_step_accumulated)
+        .def("simplify_step_accumulated", &cumesh::CuMesh::simplify_step_accumulated,
+            py::arg("quadrics"),py::arg("edge"),py::arg("skinny"),py::arg("threshold"),py::arg("max_error_squared"),
+            py::arg("timing")=false,py::arg("max_step_seconds")=INFINITY,py::call_guard<py::gil_scoped_release>())
+        .def("cancel_simplification",&cumesh::CuMesh::cancel_simplification)
+        .def("clear_simplification_cancel",&cumesh::CuMesh::clear_simplification_cancel)
+        .def("simplification_cancelled",&cumesh::CuMesh::simplification_cancelled)
         .def("simplification_admission_statistics", &cumesh::CuMesh::simplification_admission_statistics)
         .def("compute_charts", &cumesh::CuMesh::compute_charts)
         .def("read_atlas_charts", &cumesh::CuMesh::read_atlas_charts);
