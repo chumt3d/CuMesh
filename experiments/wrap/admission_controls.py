@@ -71,7 +71,7 @@ def run(out,bridge):
         try:
             value,seconds=step(mesh);ov,of=arrays(mesh);stats=mesh.cu_mesh.simplification_admission_statistics();oracle=exact_codes(ov,of,library)
             expected=oriented_triangles(expected_v,expected_f)|oriented_triangles(dvs,dfs)
-            return {'passed':oriented_triangles(ov,of)==expected and oracle=={'intersections':0,'undecided':0} and stats.get('maximumNodeVisitsPerQuery',0)>64,'statistics':stats,'exact':oracle,'nativeSeconds':seconds,'containedLockedParts':len(positions)}
+            return {'passed':oriented_triangles(ov,of)==expected and oracle=={'intersections':0,'undecided':0} and stats.get('maximumNodeVisitsPerQuery',0)>64,'statistics':stats,'exact':oracle,'nativeSeconds':seconds,'containedLockedParts':len(dvs)//4}
         finally:mesh.release_async(synchronize=True)
     record('resumption_preserves_contained_part_surface',resumption)
     def invalid():
