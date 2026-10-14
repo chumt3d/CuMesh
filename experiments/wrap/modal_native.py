@@ -78,7 +78,13 @@ def compile_native(build_id: str, identity: dict, reuse_build_id: str):
                 stderr=subprocess.STDOUT,
                 timeout=850,
             )
-        return {"path": str(directory), "returncode": process.returncode}
+        oracle_path=directory/'exact_geometry_bridge.so'
+        oracle_returncode=None
+        if process.returncode==0:
+            with log_path.open('a') as log:
+                oracle=subprocess.run(['c++','-O3','-std=c++17','-shared','-fPIC','-I','/opt/native-src/src','/opt/wrap/exact_geometry_bridge.cpp','-o',str(oracle_path)],stdout=log,stderr=subprocess.STDOUT,timeout=20)
+            oracle_returncode=oracle.returncode
+        return {"path": str(directory), "returncode": process.returncode,"oracleReturncode":oracle_returncode,"oraclePath":str(oracle_path)}
     finally:
         volume.commit()
 
