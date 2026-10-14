@@ -1,4 +1,4 @@
-"""Real WRAP output validity in three rigid print frames; no equivalence claim."""
+"""Real WRAP frame validity and zero-ended grid intervals; no equivalence claim."""
 
 import argparse
 import hashlib
@@ -47,6 +47,7 @@ def run(out):
     rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
     frames = (
         ("origin", np.eye(3), [0, 0, 0]),
+        ("origin_tilted", rz @ ry @ rx, [0, 0, 0]),
         ("print_offset_rotated", rz, [13, -7, 41.94254684448242]),
         ("far_offset_rotated", rz @ ry @ rx, [12345, -23456, 34567]),
     )
