@@ -8,7 +8,7 @@ from tqdm import tqdm
 from .xatlas import Atlas
 from . import _C
 
-SIMPLIFICATION_POLICY_VERSION = "cumesh.cumulative-cover-error-first.v4"
+SIMPLIFICATION_POLICY_VERSION = "cumesh.cumulative-cover-exact-admission.v5"
 
 
 class SimplificationFailure(RuntimeError):
@@ -515,14 +515,14 @@ class CuMesh:
                     quadrics,options.get('lambda_edge_length',1e-2),options.get('lambda_skinny',1e-3),
                     threshold,max_error_squared,options.get('timing',False))
                 quadrics=next_quadrics
-                self.last_simplification['steps'].append({"faces_before":faces,"faces_after":next_faces,"threshold":threshold,"seconds":time.monotonic()-started})
+                self.last_simplification['steps'].append({"faces_before":faces,"faces_after":next_faces,"threshold":threshold,"seconds":time.monotonic()-started,"spatialAdmission":self.cu_mesh.simplification_admission_statistics()})
                 pbar.update(faces-next_faces)
                 if target_num_faces is not None and next_faces<=target_num_faces:
                     self.last_simplification.update(status="target_reached",remaining_faces=next_faces)
                     break
                 deleted=faces-next_faces
                 if deleted==0 and error_limit is not None:
-                    self.last_simplification.update(status="error_or_topology_limit_reached",remaining_faces=next_faces)
+                    self.last_simplification.update(status="error_topology_or_spatial_limit_reached",remaining_faces=next_faces)
                     break
                 if deleted==0 and threshold==maximum:
                     raise SimplificationFailure("simplify_no_legal_progress",target_num_faces,next_faces)
@@ -532,6 +532,15 @@ class CuMesh:
             self.last_simplification["max_cluster_radius"]=float(quadrics[:,11].max().item())
         except SimplificationFailure as error:
             self.last_simplification.update(status=error.code,remaining_faces=error.remaining_faces)
+            raise
+        except RuntimeError as error:
+            prefix="[CuMesh] simplify_spatial_"
+            message=str(error)
+            if message.startswith(prefix):
+                code=message[len("[CuMesh] "):].split()[0].rstrip(":")
+                self.last_simplification.update(status=code,remaining_faces=faces)
+                raise SimplificationFailure(code,target_num_faces,faces) from error
+            self.last_simplification['status']='failed'
             raise
         except Exception:
             self.last_simplification['status']='failed'

@@ -123,6 +123,9 @@
   },
   "evidence": {
     "retained_selected_pair_codes": 500,
-    "status": "all 500 match reference codes on host; CUDA and negative contacts pending"
+    "host_contact_controls": 11,
+    "status": "host codes/control cases pass; CUDA source compiles; GPU gate/product acceptance pending",
+    "local_headers": "Torch2.5.1+cu124 / CUDA12.4 / sm89",
+    "production_runtime": "Torch2.6.0 exact build/link remains required"
   }
 }

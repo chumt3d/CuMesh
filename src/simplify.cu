@@ -3,8 +3,10 @@
 #include <cub/cub.cuh>
 #include <c10/cuda/CUDAStream.h>
 #include "shared.h"
+#include "exact_geometry/admission.h"
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 // Tiny3D modification: topology-preserving contractions and independent stars.
 // MIT (repository LICENSE). Link condition, not copied implementation:
@@ -678,6 +680,13 @@ static int select_maximal_collapse_batch(CuMesh& ctx, float threshold, cudaStrea
     return total_chosen;
 }
 
+static __global__ void restore_spatial_candidates_kernel(
+    const float* original, const int* refused, int E, float* costs
+) {
+    int edge=blockIdx.x*blockDim.x+threadIdx.x;
+    if(edge<E) costs[edge]=refused[edge]?INFINITY:original[edge];
+}
+
 
 // Eligibility reads an immutable snapshot before the commit kernel starts.
 // Only disjoint-star winners then read/write faces during this commit kernel.
@@ -807,10 +816,58 @@ void collapse_edges(
         1
     );
     CUDA_CHECK(cudaGetLastError());
+    const int device=execution_stream.device_index();
+    ctx.last_simplification_admission.clear();
+    ScopedCudaTemporary<float> original_costs(E,stream,device);
+    CUDA_CHECK(cudaMemcpyAsync(original_costs.get(),ctx.edge_collapse_costs.ptr,E*sizeof(float),cudaMemcpyDeviceToDevice,stream));
     int chosen=select_maximal_collapse_batch(ctx,collapse_thresh,stream,timing);
+    std::vector<std::unique_ptr<ScopedCudaTemporary<char>>> spatial_storage;
+    std::unique_ptr<ExactCollapseAdmission> spatial;
+    if(chosen) {
+        spatial=std::make_unique<ExactCollapseAdmission>(
+            CollapseSurface{ctx.vertices.ptr,ctx.faces.ptr,ctx.edges.ptr,ctx.vert2face.ptr,
+                ctx.vert2face_offset.ptr,ctx.edge_collapse_costs.ptr,int(F),int(E)},
+            proposed_positions,stream,[&](size_t bytes)->void* {
+                auto allocation=std::make_unique<ScopedCudaTemporary<char>>(bytes,stream,device);
+                ctx.last_simplification_admission["workspaceBytesExcludingCudaLocalStorage"]+=bytes;
+                void* pointer=allocation->get();spatial_storage.push_back(std::move(allocation));return pointer;
+            });
+        do {
+            int selected=chosen;
+            chosen=spatial->filter_selected();
+            if(timing) std::cout << "collapse_spatial: selected=" << selected << " accepted=" << chosen << std::endl;
+            if(chosen) break;
+            // Ownership selection hid competing endpoint stars. A rejected
+            // first batch cannot establish exhaustion of those alternatives.
+            restore_spatial_candidates_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE,BLOCK_SIZE,0,stream>>>(
+                original_costs.get(),spatial->refused_edges(),E,ctx.edge_collapse_costs.ptr);
+            CUDA_CHECK(cudaGetLastError());
+            propagate_cost(ctx,stream);
+            chosen=select_maximal_collapse_batch(ctx,collapse_thresh,stream,timing);
+        } while(chosen);
+        auto workspace_bytes=ctx.last_simplification_admission["workspaceBytesExcludingCudaLocalStorage"];
+        ctx.last_simplification_admission=spatial->statistics();
+        ctx.last_simplification_admission["workspaceBytesExcludingCudaLocalStorage"]=workspace_bytes;
+    }
+    if(!chosen) {
+        // A floor/refusal needs no new quadric rows, scans or geometry copies.
+        // The caller already recorded the immutable Tensor on this stream.
+        if(next_quadrics) *next_quadrics=*previous_quadrics;
+        return;
+    }
     // The newly introduced large Torch allocation must fail before geometry
     // changes. Disjoint chosen stars each remove exactly one endpoint.
     if (next_quadrics) *next_quadrics=allocate_quadric_rows(int64_t(V)-chosen,previous_quadrics->options(),output_stream,execution_stream);
+
+    // Admit every compaction workspace before committing geometry. Buffer
+    // resize discards bytes on growth, so reserve separate vertex output and
+    // retain both original surfaces until face compaction has finished.
+    ScopedCudaTemporary<float3> compact_vertices(V,stream,device);
+    ctx.temp_storage.resize(F*sizeof(int3));
+    size_t vertex_scan_bytes=0,face_scan_bytes=0;
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr,vertex_scan_bytes,ctx.vertices_map.ptr,V+1,stream));
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr,face_scan_bytes,ctx.faces_map.ptr,F+1,stream));
+    ctx.cub_temp_storage.resize(std::max(vertex_scan_bytes,face_scan_bytes));
 
     collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.vertices.ptr,
@@ -828,12 +885,7 @@ void collapse_edges(
 
     // update vertices buffer
     // get vertices map
-    size_t temp_storage_bytes = 0;
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, temp_storage_bytes,
-        ctx.vertices_map.ptr, V+1, stream
-    ));
-    ctx.cub_temp_storage.resize(temp_storage_bytes);
+    size_t temp_storage_bytes = vertex_scan_bytes;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         ctx.cub_temp_storage.ptr, temp_storage_bytes,
         ctx.vertices_map.ptr, V+1, stream
@@ -849,23 +901,17 @@ void collapse_edges(
         CUDA_CHECK(cudaGetLastError());
     }
     // compress vertices
-    ctx.temp_storage.resize(new_num_vertices * sizeof(float3));
     compress_vertices_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.vertices_map.ptr,
         ctx.vertices.ptr,
         V,
-        reinterpret_cast<float3*>(ctx.temp_storage.ptr)
+        compact_vertices.get()
     );
     CUDA_CHECK(cudaGetLastError());
-    swap_buffers(ctx.temp_storage, ctx.vertices);
 
     // update faces buffer
     // get faces map
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, temp_storage_bytes,
-        ctx.faces_map.ptr, F+1, stream
-    ));
-    ctx.cub_temp_storage.resize(temp_storage_bytes);
+    temp_storage_bytes=face_scan_bytes;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         ctx.cub_temp_storage.ptr, temp_storage_bytes,
         ctx.faces_map.ptr, F+1, stream
@@ -874,7 +920,6 @@ void collapse_edges(
     CUDA_CHECK(cudaMemcpyAsync(&new_num_faces, ctx.faces_map.ptr + F, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     // compress faces
-    ctx.temp_storage.resize(new_num_faces * sizeof(int3));
     compress_faces_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.faces_map.ptr,
         ctx.vertices_map.ptr,
@@ -883,6 +928,10 @@ void collapse_edges(
         reinterpret_cast<int3*>(ctx.temp_storage.ptr)
     );
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(ctx.vertices.release_async(stream,device));
+    TORCH_CHECK(compact_vertices.release_ownership_to(ctx.vertices,new_num_vertices,V,device),
+        "[CuMesh] simplify_compaction_publication_refused");
+    ctx.temp_storage.resize(new_num_faces*sizeof(int3));
     swap_buffers(ctx.temp_storage, ctx.faces);
 }
 
@@ -960,6 +1009,11 @@ static std::tuple<int,int> simplify_step_impl(CuMesh& ctx,float lambda_edge_leng
 
 std::tuple<int,int> CuMesh::simplify_step(float edge,float skinny,float threshold,bool timing) {
     return simplify_step_impl(*this,edge,skinny,threshold,timing,nullptr,nullptr,INFINITY,nullptr);
+}
+
+std::map<std::string,uint64_t> CuMesh::simplification_admission_statistics() {
+    CuMeshOperationScope operation(*this);
+    return last_simplification_admission;
 }
 
 // Call-owned Tensor state survives clear_cache without adding sticky native state.

@@ -579,7 +579,7 @@ def execute(out, mode, selected):
                         valid
                         and len(output_faces) == 4
                         and row["native_steps"]["status"]
-                        == "error_or_topology_limit_reached"
+                        == "error_topology_or_spatial_limit_reached"
                         and np.array_equal(output_vertices, vertices)
                         and np.array_equal(output_faces, faces)
                     )
@@ -588,7 +588,7 @@ def execute(out, mode, selected):
                         valid
                         and 4 <= len(output_faces) < len(faces)
                         and row["native_steps"]["status"]
-                        == "error_or_topology_limit_reached"
+                        == "error_topology_or_spatial_limit_reached"
                     )
                 elif name == "cube72":
                     valid = valid and 4 <= len(output_faces) <= target

@@ -37,6 +37,7 @@ def build(out, identity, reuse=None):
         "geometry.cu",
         "io.cu",
         "simplify.cu",
+        "exact_geometry/admission.cu",
         "shared.cu",
         "ext.cpp",
     ]

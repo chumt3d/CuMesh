@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <atomic>
 #include <memory>
+#include <map>
+#include <vector>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -607,6 +609,8 @@ public:
     std::tuple<int, int> simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing=false);
     torch::Tensor initial_simplification_quadrics();
     std::tuple<int,int,torch::Tensor> simplify_step_accumulated(const torch::Tensor& quadrics,float lambda_edge_length,float lambda_skinny,float threshold,double max_error_squared,bool timing=false);
+    std::map<std::string,uint64_t> last_simplification_admission;
+    std::map<std::string,uint64_t> simplification_admission_statistics();
 
 
     // Atlasing functions

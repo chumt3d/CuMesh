@@ -85,6 +85,7 @@ ext_modules = [
             "src/geometry.cu",
             "src/io.cu",
             "src/simplify.cu",
+            "src/exact_geometry/admission.cu",
             "src/shared.cu",
 
             "src/ext.cpp",
