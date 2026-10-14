@@ -22,7 +22,8 @@ public:
   ExactCollapseAdmission(CollapseSurface mesh, const float3 *proposals,
                          cudaStream_t stream, const Allocator &allocate,
                          double max_seconds,
-                         const std::function<bool()> &cancelled);
+                         const std::function<bool()> &cancelled,
+                         bool input_known_clean = false);
   ~ExactCollapseAdmission();
   ExactCollapseAdmission(const ExactCollapseAdmission &) = delete;
   ExactCollapseAdmission &operator=(const ExactCollapseAdmission &) = delete;

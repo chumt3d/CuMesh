@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -116,6 +117,7 @@ void quarantine_buffer_async_free_failure(
 ) noexcept;
 void require_cuda_allocation_quarantine_clear();
 std::size_t cuda_allocation_quarantine_count() noexcept;
+std::optional<std::uint64_t> cuda_allocation_quarantine_epoch_if_clear() noexcept;
 cudaError_t retry_cuda_allocation_quarantine() noexcept;
 cudaError_t record_cuda_allocation_owner_completion(
     CudaAllocationOwnerRecord* owner,

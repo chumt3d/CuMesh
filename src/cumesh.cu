@@ -669,6 +669,14 @@ std::size_t cuda_allocation_quarantine_count() noexcept {
     return owner.quarantined_count;
 }
 
+std::optional<std::uint64_t> cuda_allocation_quarantine_epoch_if_clear() noexcept {
+    auto& owner = cuda_allocation_owner();
+    std::lock_guard<std::mutex> lock(owner.mutex);
+    if (owner.quarantined_count != 0 || owner.admission_closed)
+        return std::nullopt;
+    return owner.quarantine_epoch;
+}
+
 cudaError_t retry_cuda_allocation_quarantine() noexcept {
     auto& owner = cuda_allocation_owner();
     CudaAllocationOwnerRecord* claimed_head = nullptr;
@@ -1378,6 +1386,7 @@ CuMeshOperationScope::CuMeshOperationScope(CuMesh& owner)
       lock_(owner.operation_mutex_),
       canonical_stream_(owner.canonical_stream_locked()),
       caller_stream_(c10::cuda::getCurrentCUDAStream(canonical_stream_.device_index())) {
+    try {
     require_cuda_allocation_quarantine_clear();
     owner_.require_operable_locked();
     TORCH_CHECK(
@@ -1393,14 +1402,26 @@ CuMeshOperationScope::CuMeshOperationScope(CuMesh& owner)
         ingress_event_.block(canonical_stream_);
     }
     stream_guard_.emplace(canonical_stream_);
+    } catch (...) {
+        owner_.invalidate_spatial_audit_locked();
+        throw;
+    }
 }
 
 CuMeshOperationScope::~CuMeshOperationScope() noexcept(false) {
+    if (std::uncaught_exceptions() != 0) {
+        owner_.invalidate_spatial_audit_locked();
+    }
     if (bridged_to_caller_) {
         return;
     }
     if (std::uncaught_exceptions() == 0) {
-        bridge_to_caller();
+        try {
+            bridge_to_caller();
+        } catch (...) {
+            owner_.invalidate_spatial_audit_locked();
+            throw;
+        }
         return;
     }
     try {
@@ -1459,6 +1480,8 @@ void CuMesh::swap(CuMesh& other) {
     }
 
     std::scoped_lock lock(operation_mutex_, other.operation_mutex_);
+    invalidate_spatial_audit_locked();
+    other.invalidate_spatial_audit_locked();
     require_cuda_allocation_quarantine_clear();
     require_operable_locked();
     other.require_operable_locked();
@@ -1541,6 +1564,7 @@ void CuMesh::swap(CuMesh& other) {
 
 ReleaseResult CuMesh::release_async(bool synchronize) {
     std::unique_lock<std::recursive_mutex> lock(operation_mutex_);
+    invalidate_spatial_audit_locked();
     auto buffers = all_buffers();
     static_assert(std::tuple_size_v<decltype(buffers)> == buffer_slot_count);
     int device_index = require_single_device(buffers, "release_async");
@@ -2143,6 +2167,53 @@ void CuMesh::reset_metadata() noexcept {
     atlas_num_charts = 0;
 }
 
+void CuMesh::invalidate_spatial_audit_locked() noexcept {
+    spatial_audit_state_ = SpatialAuditState::unknown;
+    ++geometry_revision_;
+}
+
+bool CuMesh::spatial_input_clean_after_selection_sync_locked() noexcept {
+    const auto quarantine_epoch = cuda_allocation_quarantine_epoch_if_clear();
+    // Recovery can empty global Q before this owner is used again. The
+    // allocator's existing epoch remembers that intervening failure.
+    if (!quarantine_epoch || spatial_audit_quarantine_epoch_ != *quarantine_epoch)
+        invalidate_spatial_audit_locked();
+    if (spatial_audit_cancelled_.exchange(false,std::memory_order_acq_rel))
+        invalidate_spatial_audit_locked();
+    if (spatial_audit_state_ == SpatialAuditState::pending_commit
+        && spatial_audit_revision_ == geometry_revision_)
+        spatial_audit_state_ = SpatialAuditState::verified_clean;
+    return spatial_audit_state_ == SpatialAuditState::verified_clean
+        && spatial_audit_revision_ == geometry_revision_;
+}
+
+void CuMesh::record_verified_spatial_input_locked(bool input_reused) noexcept {
+    const auto quarantine_epoch = cuda_allocation_quarantine_epoch_if_clear();
+    if (!quarantine_epoch || spatial_audit_cancelled_.load(std::memory_order_acquire)
+        || simplification_cancelled()
+        || (input_reused && spatial_audit_quarantine_epoch_ != *quarantine_epoch)) {
+        invalidate_spatial_audit_locked();
+        return;
+    }
+    spatial_audit_revision_ = geometry_revision_;
+    // Only an actually completed full audit may establish a fresh binding.
+    // Reaffirming a skipped audit must keep the epoch checked before reuse.
+    if (!input_reused) spatial_audit_quarantine_epoch_ = *quarantine_epoch;
+    spatial_audit_state_ = SpatialAuditState::verified_clean;
+}
+
+void CuMesh::record_pending_spatial_commit_locked() noexcept {
+    const auto quarantine_epoch = cuda_allocation_quarantine_epoch_if_clear();
+    if (!quarantine_epoch || spatial_audit_quarantine_epoch_ != *quarantine_epoch
+        || spatial_audit_cancelled_.load(std::memory_order_acquire)
+        || simplification_cancelled()) {
+        invalidate_spatial_audit_locked();
+        return;
+    }
+    spatial_audit_revision_ = geometry_revision_;
+    spatial_audit_state_ = SpatialAuditState::pending_commit;
+}
+
 void CuMesh::reset_cache_metadata() noexcept {
     num_conn_comps = 0;
     num_bound_conn_comps = 0;
@@ -2162,6 +2233,7 @@ void CuMesh::require_operable_locked() const {
 }
 
 void CuMesh::quarantine_operation_scope_failure_noexcept(const char* reason) noexcept {
+    invalidate_spatial_audit_locked();
     durable_global_quarantine_ = true;
     try {
         quarantine_reason_ = reason;
@@ -2191,6 +2263,7 @@ c10::cuda::CUDAStream CuMesh::canonical_stream_locked() const {
 
 void CuMesh::release_fallback_noexcept() noexcept {
     std::unique_lock<std::recursive_mutex> lock(operation_mutex_);
+    invalidate_spatial_audit_locked();
     auto buffers = all_buffers();
     static_assert(std::tuple_size_v<decltype(buffers)> == buffer_slot_count);
     if (count_allocated(buffers) == 0) {

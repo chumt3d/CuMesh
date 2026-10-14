@@ -33,6 +33,7 @@ static __global__ void copy_T_to_T3_kernel(
 
 void CuMesh::remove_faces(torch::Tensor& face_mask) {
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     size_t F = this->faces.size;
     TORCH_CHECK(face_mask.is_cuda(), "[CuMesh] remove_faces mask must be a CUDA tensor");
     TORCH_CHECK(face_mask.scalar_type() == torch::kBool, "[CuMesh] remove_faces mask must have bool dtype");
@@ -78,6 +79,7 @@ void CuMesh::remove_faces(torch::Tensor& face_mask) {
 
 void CuMesh::_remove_faces(uint8_t* face_mask) {
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     cudaStream_t stream = current_stream();
     size_t F = this->faces.size;
 
@@ -154,6 +156,7 @@ static __global__ void remap_faces_kernel(
 
 void CuMesh::remove_unreferenced_vertices() {
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     cudaStream_t stream = current_stream();
     size_t V = this->vertices.size;
     size_t F = this->faces.size;
@@ -260,6 +263,7 @@ struct int3_decomposer
 
 void CuMesh::remove_duplicate_faces() {
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     cudaStream_t stream = current_stream();
     size_t F = this->faces.size;
 
@@ -380,6 +384,7 @@ static __global__ void mark_degenerate_faces_kernel(
 
 void CuMesh::remove_degenerate_faces(float abs_thresh, float rel_thresh) {
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     size_t F = this->faces.size;
 
     ScopedCudaTemporary<uint8_t> face_mask_storage(F, operation.stream(), operation.device_index());
@@ -463,6 +468,7 @@ struct LessThanOp {
 
 void CuMesh::fill_holes(float max_hole_perimeter) {
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     cudaStream_t stream = current_stream();
     if (this->loop_boundaries.is_empty() || this->loop_boundaries_offset.is_empty()) {
         this->get_boundary_loops();
@@ -813,6 +819,7 @@ static __global__ void index_vertice_kernel(
 
 void CuMesh::repair_non_manifold_edges(){
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     cudaStream_t stream = current_stream();
     // Always recompute manifold_face_adj to ensure it's up to date
     // especially after operations like simplify() that modify the mesh
@@ -929,6 +936,7 @@ static __global__ void mark_non_manifold_faces_kernel(
 
 void CuMesh::remove_non_manifold_faces() {
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     cudaStream_t stream = current_stream();
     // Get edge-face adjacency information
     if (this->edge2face.is_empty() || this->edge2face_offset.is_empty()) {
@@ -973,6 +981,7 @@ struct GreaterThanOrEqualToOp {
 
 void CuMesh::remove_small_connected_components(float min_area) {
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     cudaStream_t stream = current_stream();
     if (this->conn_comp_ids.is_empty()) {
         this->get_connected_components();
@@ -1228,6 +1237,7 @@ static __global__ void inplace_flip_faces_with_flags_kernel(
 
 void CuMesh::unify_face_orientations() {
     CuMeshOperationScope operation(*this);
+    invalidate_spatial_audit_locked();
     cudaStream_t stream = current_stream();
     if (this->manifold_face_adj.is_empty()) {
         this->get_manifold_face_adjacency();

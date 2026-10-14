@@ -835,6 +835,9 @@ void collapse_edges(
     ScopedCudaTemporary<float> original_costs(E,stream,device);
     CUDA_CHECK(cudaMemcpyAsync(original_costs.get(),ctx.edge_collapse_costs.ptr,E*sizeof(float),cudaMemcpyDeviceToDevice,stream));
     int chosen=select_maximal_collapse_batch(ctx,collapse_thresh,stream,timing,control);
+    // That existing selection-wave host sync observed any previous admitted
+    // compaction. Enqueue success and stream-bridge events are not such proof.
+    const bool input_known_clean=ctx.spatial_input_clean_after_selection_sync_locked();
     std::vector<std::unique_ptr<ScopedCudaTemporary<char>>> spatial_storage;
     std::unique_ptr<ExactCollapseAdmission> spatial;
     if(chosen) {
@@ -846,8 +849,9 @@ void collapse_edges(
                 auto allocation=std::make_unique<ScopedCudaTemporary<char>>(bytes,stream,device);
                 ctx.last_simplification_admission["workspaceBytesExcludingCudaLocalStorage"]+=bytes;
                 void* pointer=allocation->get();spatial_storage.push_back(std::move(allocation));return pointer;
-            },control.remaining(),[&ctx]{return ctx.simplification_cancelled();});
+            },control.remaining(),[&ctx]{return ctx.simplification_cancelled();},input_known_clean);
         constructor_range.finish();
+        ctx.record_verified_spatial_input_locked(input_known_clean);
         do {
             control.check();
             int selected=chosen;
@@ -889,6 +893,7 @@ void collapse_edges(
     ctx.cub_temp_storage.resize(std::max(vertex_scan_bytes,face_scan_bytes));
 
     control.check();
+    ctx.invalidate_spatial_audit_locked();
     collapse_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
         ctx.vertices.ptr,
         ctx.faces.ptr,
@@ -953,6 +958,10 @@ void collapse_edges(
         "[CuMesh] simplify_compaction_publication_refused");
     ctx.temp_storage.resize(new_num_faces*sizeof(int3));
     swap_buffers(ctx.temp_storage, ctx.faces);
+    // Final face compression has only been enqueued. A later existing
+    // selection sync must observe successful completion before reuse.
+    if (control.remaining()>0.0 && !ctx.simplification_cancelled())
+        ctx.record_pending_spatial_commit_locked();
 }
 
 

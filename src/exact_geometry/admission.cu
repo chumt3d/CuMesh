@@ -426,7 +426,7 @@ struct ExactCollapseAdmission::Impl {
   size_t workspace_bytes = 0;
   Impl(CollapseSurface m, const float3 *p, cudaStream_t s,
        const ExactCollapseAdmission::Allocator &allocate, double seconds,
-       const std::function<bool()> &cancel)
+       const std::function<bool()> &cancel, bool input_known_clean)
       : max_seconds(seconds), cancelled(cancel), mesh(m), stream(s),
         F(m.face_count), E(m.edge_count),
         old{m.vertices, m.faces, m.edges, p, nullptr, false}, new_surface(old),
@@ -463,9 +463,16 @@ struct ExactCollapseAdmission::Impl {
     build(current, F, ids.get(), old);
     CUMESH_SPATIAL_CUDA_CHECK(
         cudaMemsetAsync(counts.get(), 0, sizeof(QueryCounts), stream));
-    query(old, ids.get(), F, old, current.view(F), audit_current, nullptr,
-          nullptr);
-    check("input");
+    statistics["inputAuditReused"] = input_known_clean;
+    if (!input_known_clean) {
+      query(old, ids.get(), F, old, current.view(F), audit_current, nullptr,
+            nullptr);
+      check("input");
+    } else {
+      statistics["inputNodeVisits"] = 0;
+      statistics["inputLeafTests"] = 0;
+      statistics["inputQueries"] = 0;
+    }
   }
   void build(Tree &t, int n, const int *input, Surface surface) {
     private_profile::Range range(&t == &current
@@ -632,12 +639,12 @@ struct ExactCollapseAdmission::Impl {
 ExactCollapseAdmission::ExactCollapseAdmission(
     CollapseSurface m, const float3 *p, cudaStream_t s,
     const Allocator &allocate, double max_seconds,
-    const std::function<bool()> &cancelled) {
+    const std::function<bool()> &cancelled, bool input_known_clean) {
   require(max_seconds > 0.0 && !std::isnan(max_seconds),
           "[CuMesh] simplify_spatial_deadline");
   require(m.face_count > 0 && m.face_count <= INT_MAX / 2 && m.edge_count >= 0,
           "[CuMesh] simplify_spatial_index_overflow");
-  impl_ = std::make_unique<Impl>(m, p, s, allocate, max_seconds, cancelled);
+  impl_ = std::make_unique<Impl>(m, p, s, allocate, max_seconds, cancelled, input_known_clean);
 }
 ExactCollapseAdmission::~ExactCollapseAdmission() = default;
 int ExactCollapseAdmission::filter_selected() { return impl_->filter(); }

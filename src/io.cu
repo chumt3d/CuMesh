@@ -153,6 +153,7 @@ void CuMesh::init(const torch::Tensor& vertices, const torch::Tensor& faces) {
     );
     const int input_device = vertices.get_device();
     std::unique_lock<std::recursive_mutex> lock(operation_mutex_);
+    invalidate_spatial_audit_locked();
     require_cuda_allocation_quarantine_clear();
     require_operable_locked();
     TORCH_CHECK(

@@ -82,6 +82,7 @@ struct ReleaseResult {
 };
 
 class CuMesh;
+struct SimplificationControl;
 
 class CuMeshOperationScope {
 public:
@@ -610,7 +611,10 @@ public:
     torch::Tensor initial_simplification_quadrics();
     std::tuple<int,int,torch::Tensor> simplify_step_accumulated(const torch::Tensor& quadrics,float lambda_edge_length,float lambda_skinny,float threshold,double max_error_squared,bool timing=false,double max_step_seconds=INFINITY);
     std::atomic<bool> simplification_cancel_requested{false};
-    void cancel_simplification() noexcept {simplification_cancel_requested.store(true,std::memory_order_release);}
+    void cancel_simplification() noexcept {
+        spatial_audit_cancelled_.store(true,std::memory_order_release);
+        simplification_cancel_requested.store(true,std::memory_order_release);
+    }
     void clear_simplification_cancel() noexcept {simplification_cancel_requested.store(false,std::memory_order_release);}
     bool simplification_cancelled() const noexcept {return simplification_cancel_requested.load(std::memory_order_acquire);}
     std::map<std::string,uint64_t> last_simplification_admission;
@@ -664,6 +668,9 @@ public:
 
 private:
     friend class CuMeshOperationScope;
+    friend void collapse_edges(CuMesh&,float,cudaStream_t,bool,const float3*,
+        const torch::Tensor*,torch::Tensor*,int*,double*,const c10::cuda::CUDAStream&,
+        const c10::cuda::CUDAStream&,const SimplificationControl&);
 
     auto all_buffers() noexcept {
         return std::tie(
@@ -829,10 +836,23 @@ private:
     c10::cuda::CUDAStream canonical_stream_locked() const;
     void reset_cache_metadata() noexcept;
     void quarantine_operation_scope_failure_noexcept(const char* reason) noexcept;
+    // Only absence of forbidden/undecided contacts is certified, not manifoldness
+    // or complete validity. Revision advances before mutation/failure; all access
+    // except the cancellation notice is protected by operation_mutex_.
+    enum class SpatialAuditState { unknown, pending_commit, verified_clean };
+    void invalidate_spatial_audit_locked() noexcept;
+    bool spatial_input_clean_after_selection_sync_locked() noexcept;
+    void record_verified_spatial_input_locked(bool input_reused) noexcept;
+    void record_pending_spatial_commit_locked() noexcept;
 
     mutable std::recursive_mutex operation_mutex_;
     const std::uint64_t owner_id_;
     std::uint64_t generation_ = 0;
+    std::uint64_t geometry_revision_ = 0;
+    std::uint64_t spatial_audit_revision_ = 0;
+    std::uint64_t spatial_audit_quarantine_epoch_ = 0;
+    SpatialAuditState spatial_audit_state_ = SpatialAuditState::unknown;
+    std::atomic<bool> spatial_audit_cancelled_{false};
     int canonical_device_index_ = -1;
     std::optional<c10::cuda::CUDAStream> canonical_stream_;
     // These are independent facts: a completion token can later prove local
