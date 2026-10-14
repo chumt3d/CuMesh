@@ -32,3 +32,21 @@ def trap_geometry(v,f,nv,nf,library):
     badv=np.concatenate([nv,tv]);badf=np.concatenate([nf,tf+len(nv)])
     if exact_codes(badv,badf,library)['intersections']==0:raise RuntimeError('trap does not actually obstruct preferred proposal')
     return v,f,tv,tf
+
+
+def resumption_geometry(v,f,expected_v,tf):
+    points=expected_v
+    if len(points)!=4:raise RuntimeError('resumption fixture requires four output vertices')
+    positions=[]
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                weights=np.array([.2+i*.05,.2+j*.05,.2+k*.05,1-.6-(i+j+k)*.05])
+                positions.append(weights@points)
+    original=v[f].astype(np.float64);n=np.cross(original[:,1]-original[:,0],original[:,2]-original[:,0]);n/=np.linalg.norm(n,axis=1)[:,None]
+    margin=min(np.min(-np.einsum('ij,ij->i',c-original[:,0],n)) for c in positions)
+    if margin<=0:raise RuntimeError('contained decoy fixture is outside original body')
+    epsilon=margin/1024
+    dvs=np.concatenate([(c+epsilon*np.array([[1,1,1],[1,-1,-1],[-1,1,-1],[-1,-1,1]])).astype(np.float32) for c in positions]);dfs=np.concatenate([tf+4*i for i in range(len(positions))])
+    iv=np.concatenate([v,dvs]);iff=np.concatenate([f,dfs+len(v)])
+    return iv,iff,dvs,dfs
