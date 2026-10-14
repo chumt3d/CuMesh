@@ -46,7 +46,7 @@ def preflight(args):
     roots={ 'mesh':mesh,'base':mesh,'cumesh.CuMesh':cumesh.CuMesh,
             'WarpUnsignedDistanceBVH':WarpUnsignedDistanceBVH,
             'bvh':WarpUnsignedDistanceBVH,'witness_bvh':WarpUnsignedDistanceBVH }
-    files=[Path(__file__).with_name('collapse_controls.py'),args.admission or Path(__file__).with_name('admission_controls.py')]
+    files=[Path(__file__).with_name('collapse_controls.py'),args.admission or Path(__file__).with_name('admission_controls.py'),*args.driver]
     package=Path(cumesh_wrap.__file__).parent
     files.extend(package/n for n in ('reduction.py','engine.py','deviation.py'))
     rows=[];calls=0;attributes=[]
@@ -115,4 +115,4 @@ def preflight(args):
     args.out.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps({k:result[k] for k in ('status','seconds','CuMeshCallsChecked','torch','nativeBinarySha256','trapExact')}));return result
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--out',required=True,type=Path);p.add_argument('--bridge',required=True,type=Path);p.add_argument('--before',required=True,type=Path);p.add_argument('--after',required=True,type=Path);p.add_argument('--binary-sha');p.add_argument('--admission',type=Path);preflight(p.parse_args())
+    p=argparse.ArgumentParser();p.add_argument('--out',required=True,type=Path);p.add_argument('--bridge',required=True,type=Path);p.add_argument('--before',required=True,type=Path);p.add_argument('--after',required=True,type=Path);p.add_argument('--binary-sha');p.add_argument('--admission',type=Path);p.add_argument('--driver',type=Path,action='append',default=[]);preflight(p.parse_args())
